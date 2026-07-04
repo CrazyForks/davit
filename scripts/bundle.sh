@@ -58,7 +58,12 @@ if [ "${1:-}" = "--vendor" ]; then
   fi
 fi
 
-echo "==> Codesigning (ad-hoc)"
-codesign --force --deep -s - "$APP"
+if [ -n "${CODESIGN_IDENTITY:-}" ]; then
+  echo "==> Codesigning with Developer ID (hardened runtime)"
+  codesign --force --options runtime --timestamp -s "$CODESIGN_IDENTITY" "$APP"
+else
+  echo "==> Codesigning (ad-hoc)"
+  codesign --force --deep -s - "$APP"
+fi
 
 echo "==> Done: $APP"

@@ -8,9 +8,14 @@ on:
 permissions:
   contents: write
 
+env:
+  # Presence of the cert secret switches the whole pipeline to Developer ID
+  # signing + notarization; without it, builds are ad-hoc signed.
+  MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+
 jobs:
   release:
-    # Apple silicon runner; the apple/container dependency needs Swift 6.2+ (Xcode 26)
+    # Apple silicon runner; the apple/container dependency needs Swift 6.2+
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
@@ -32,16 +37,84 @@ jobs:
           key: spm-${{ runner.os }}-${{ hashFiles('Package.resolved') }}
           restore-keys: spm-${{ runner.os }}-
 
+      - name: Import signing certificate
+        if: env.MACOS_CERT_P12 != ''
+        env:
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          KEYCHAIN_PWD=$(uuidgen)
+          security create-keychain -p "$KEYCHAIN_PWD" build.keychain-db
+          security set-keychain-settings -lut 21600 build.keychain-db
+          security unlock-keychain -p "$KEYCHAIN_PWD" build.keychain-db
+          echo "$MACOS_CERT_P12" | base64 --decode > cert.p12
+          security import cert.p12 -k build.keychain-db -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          rm cert.p12
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PWD" build.keychain-db
+          security list-keychains -d user -s build.keychain-db login.keychain-db
+          IDENTITY=$(security find-identity -v -p codesigning build.keychain-db \
+            | grep "Developer ID Application" | head -1 | sed -E 's/.*"(.+)"/\1/')
+          if [ -z "$IDENTITY" ]; then
+            echo "No Developer ID Application identity found in certificate" >&2
+            exit 1
+          fi
+          echo "CODESIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+          echo "Using identity: $IDENTITY"
+
       - name: Build app bundle
         run: |
           export VERSION="${GITHUB_REF_NAME#v}"
           scripts/bundle.sh
+
+      - name: Notarize
+        if: env.MACOS_CERT_P12 != ''
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          ditto -c -k --keepParent "dist/Davit.app" "notarize.zip"
+          xcrun notarytool submit notarize.zip \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --wait --timeout 30m
+          xcrun stapler staple "dist/Davit.app"
+          rm notarize.zip
 
       - name: Zip app
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           ditto -c -k --keepParent "dist/Davit.app" "Davit-${VERSION}.zip"
           shasum -a 256 "Davit-${VERSION}.zip" > "Davit-${VERSION}.zip.sha256"
+
+      - name: Write release notes
+        run: |
+          if [ -n "$MACOS_CERT_P12" ]; then
+            cat > RELEASE_NOTES.md <<'NOTES'
+          ## Install
+
+          Download the zip below, unzip, and move `Davit.app` to /Applications.
+          This build is Developer ID signed and notarized — it opens like any other app.
+
+          Requires an Apple silicon Mac. On first launch Davit offers to install
+          Apple's container platform if it isn't present (no admin rights needed).
+          NOTES
+          else
+            cat > RELEASE_NOTES.md <<'NOTES'
+          ## Install
+
+          1. Download the zip below, unzip, and move `Davit.app` to /Applications.
+          2. This build is not notarized (ad-hoc signature), so macOS will refuse to
+             open it until you clear the quarantine flag:
+
+             ```sh
+             xattr -dr com.apple.quarantine /Applications/Davit.app
+             ```
+
+          Requires an Apple silicon Mac. On first launch Davit offers to install
+          Apple's container platform if it isn't present (no admin rights needed).
+          NOTES
+          fi
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -50,17 +123,4 @@ jobs:
             Davit-*.zip
             Davit-*.zip.sha256
           generate_release_notes: true
-          body: |
-            ## Install
-
-            1. Download `Davit-${{ github.ref_name }}.zip` below and unzip.
-            2. Move `Davit.app` to /Applications.
-            3. This build is not notarized (ad-hoc signature), so macOS will refuse to
-               open it until you clear the quarantine flag:
-
-               ```sh
-               xattr -dr com.apple.quarantine /Applications/Davit.app
-               ```
-
-            Requires an Apple silicon Mac. On first launch Davit offers to install
-            Apple's container platform if it isn't present (no admin rights needed).
+          body_path: RELEASE_NOTES.md

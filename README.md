@@ -34,9 +34,21 @@ in-terminal shell (`davit exec`), and even launchd service bootstrap all go thro
 ## Releases
 
 Tagging `v*` triggers a GitHub Actions workflow that builds the app on a macOS
-runner and attaches `Davit-<version>.zip` (+ sha256) to a GitHub Release. CI
-builds are ad-hoc signed, so after downloading:
-`xattr -dr com.apple.quarantine /Applications/Davit.app`.
+runner and attaches `Davit-<version>.zip` (+ sha256) to a GitHub Release.
+
+With these repository secrets set, releases are Developer ID signed (hardened
+runtime) and notarized, so they open like any other app:
+
+| Secret | Value |
+|---|---|
+| `MACOS_CERT_P12` | base64 of the exported "Developer ID Application" cert (`base64 -i cert.p12`) |
+| `MACOS_CERT_PASSWORD` | the .p12 export password |
+| `APPLE_ID` | your Apple ID email |
+| `APPLE_TEAM_ID` | 10-char team id (developer.apple.com → Membership) |
+| `APPLE_APP_SPECIFIC_PASSWORD` | app-specific password from appleid.apple.com |
+
+Without the secrets, builds fall back to ad-hoc signing and the release notes
+include the `xattr -dr com.apple.quarantine` workaround.
 
 ## Build & run
 
