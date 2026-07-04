@@ -63,9 +63,11 @@ struct ContainersView: View {
             .sheet(isPresented: $showRunSheet) {
                 RunContainerSheet()
             }
-            .sheet(item: $state.recreateTarget) { target in
-                RunContainerSheet(recreate: target)
-            }
+        }
+        // Attached to the NavigationStack, not the content Group: two .sheet
+        // modifiers on the same node shadow each other on macOS.
+        .sheet(item: $state.recreateTarget) { target in
+            RunContainerSheet(recreate: target)
         }
     }
 

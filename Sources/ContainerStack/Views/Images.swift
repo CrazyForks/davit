@@ -52,9 +52,10 @@ struct ImagesView: View {
                 }
             }
             .sheet(isPresented: $showPullSheet) { PullImageSheet() }
-            .sheet(item: $runFromImage) { image in
-                RunContainerSheet(prefilledImage: image.name)
-            }
+        }
+        // Separate node from the pull sheet — same-node sheets shadow each other.
+        .sheet(item: $runFromImage) { image in
+            RunContainerSheet(prefilledImage: image.name)
         }
     }
 
