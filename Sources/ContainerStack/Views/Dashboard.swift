@@ -103,35 +103,7 @@ struct DashboardView: View {
     private var diskCard: some View {
         DetailCard(title: "Disk Usage", icon: "internaldrive") {
             if let df = state.diskUsage {
-                let maxSize = max(df.images?.sizeInBytes ?? 0, df.containers?.sizeInBytes ?? 0, df.volumes?.sizeInBytes ?? 0, 1)
-                VStack(spacing: 10) {
-                    DiskRow(label: "Images", section: df.images, tint: .blue, maxSize: maxSize)
-                    DiskRow(label: "Containers", section: df.containers, tint: .green, maxSize: maxSize)
-                    DiskRow(label: "Volumes", section: df.volumes, tint: .purple, maxSize: maxSize)
-
-                    let reclaimable = (df.images?.reclaimable ?? 0) + (df.containers?.reclaimable ?? 0) + (df.volumes?.reclaimable ?? 0)
-                    if reclaimable > 0 {
-                        Divider()
-                        HStack {
-                            Text("\(formatBytes(reclaimable)) reclaimable")
-                                .font(.callout)
-                                .foregroundStyle(.secondary)
-                            Spacer()
-                            Menu("Clean Up…") {
-                                Button("Prune Stopped Containers") {
-                                    state.perform("prune") { try await ContainerService.pruneContainers() }
-                                }
-                                Button("Prune Unused Images") {
-                                    state.perform("prune") { try await ContainerService.pruneImages(all: true) }
-                                }
-                                Button("Prune Unused Volumes") {
-                                    state.perform("prune") { try await ContainerService.pruneVolumes() }
-                                }
-                            }
-                            .fixedSize()
-                        }
-                    }
-                }
+                DiskUsageContent(df: df)
             } else {
                 Text("—").foregroundStyle(.secondary)
             }
@@ -206,6 +178,60 @@ struct DashboardView: View {
                 .chartYAxisLabel("%")
                 .frame(height: 180)
             }
+        }
+    }
+}
+
+/// Split out of DashboardView.diskCard: the combined expression exceeded the
+/// type-checker budget on older Swift compilers (CI).
+struct DiskUsageContent: View {
+    @EnvironmentObject var state: AppState
+    let df: DiskUsage
+
+    private var maxSize: Int64 {
+        let sizes: [Int64] = [
+            df.images?.sizeInBytes ?? 0,
+            df.containers?.sizeInBytes ?? 0,
+            df.volumes?.sizeInBytes ?? 0,
+            1,
+        ]
+        return sizes.max() ?? 1
+    }
+
+    private var reclaimable: Int64 {
+        (df.images?.reclaimable ?? 0) + (df.containers?.reclaimable ?? 0) + (df.volumes?.reclaimable ?? 0)
+    }
+
+    var body: some View {
+        VStack(spacing: 10) {
+            DiskRow(label: "Images", section: df.images, tint: .blue, maxSize: maxSize)
+            DiskRow(label: "Containers", section: df.containers, tint: .green, maxSize: maxSize)
+            DiskRow(label: "Volumes", section: df.volumes, tint: .purple, maxSize: maxSize)
+            if reclaimable > 0 {
+                Divider()
+                cleanupRow
+            }
+        }
+    }
+
+    private var cleanupRow: some View {
+        HStack {
+            Text("\(formatBytes(reclaimable)) reclaimable")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            Spacer()
+            Menu("Clean Up…") {
+                Button("Prune Stopped Containers") {
+                    state.perform("prune") { try await ContainerService.pruneContainers() }
+                }
+                Button("Prune Unused Images") {
+                    state.perform("prune") { try await ContainerService.pruneImages(all: true) }
+                }
+                Button("Prune Unused Volumes") {
+                    state.perform("prune") { try await ContainerService.pruneVolumes() }
+                }
+            }
+            .fixedSize()
         }
     }
 }
