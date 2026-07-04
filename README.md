@@ -31,6 +31,13 @@ in-terminal shell (`davit exec`), and even launchd service bootstrap all go thro
 - Apple silicon Mac, macOS 15+ (macOS 26 recommended — matches `container` 1.0)
 - [apple/container](https://github.com/apple/container/releases) installed (or vendored, see below)
 
+## Releases
+
+Tagging `v*` triggers a GitHub Actions workflow that builds the app on a macOS
+runner and attaches `Davit-<version>.zip` (+ sha256) to a GitHub Release. CI
+builds are ad-hoc signed, so after downloading:
+`xattr -dr com.apple.quarantine /Applications/Davit.app`.
+
 ## Build & run
 
 ```sh
