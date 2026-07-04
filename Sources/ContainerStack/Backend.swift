@@ -1085,3 +1085,49 @@ enum ShellCommandInstaller {
         "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 }
+
+// MARK: - Recreate support (containers are immutable; edit = replace)
+
+extension ContainerService {
+    struct RecreatePrefill {
+        /// What the user originally passed after the image (entrypoint/CMD subtracted).
+        var commandArgs: [String] = []
+        /// Env vars that aren't part of the image config (i.e. user-supplied).
+        var customEnv: [String] = []
+    }
+
+    /// Reconstructs user-level run inputs from a container's resolved init process,
+    /// by comparing against the image's entrypoint/cmd/env.
+    static func recreatePrefill(for record: ContainerRecord) async -> RecreatePrefill {
+        var prefill = RecreatePrefill()
+        let full = [record.configuration.initProcess?.executable].compactMap { $0 }
+            + (record.configuration.initProcess?.arguments ?? [])
+        let recordEnv = record.configuration.initProcess?.environment ?? []
+
+        guard let reference = record.configuration.image?.reference,
+              let config = try? await Backend.systemConfig(),
+              let image = try? await ClientImage.get(reference: reference, containerSystemConfig: config),
+              let platform = record.configuration.platform,
+              let ociImage = try? await image.config(for: ContainerizationOCI.Platform(
+                  arch: platform.architecture ?? "arm64", os: platform.os ?? "linux"))
+        else {
+            // Can't resolve the image config — fall back to the full command and env.
+            prefill.commandArgs = full
+            prefill.customEnv = recordEnv
+            return prefill
+        }
+
+        let entrypoint = ociImage.config?.entrypoint ?? []
+        let cmd = ociImage.config?.cmd ?? []
+        if !entrypoint.isEmpty, full.count >= entrypoint.count, Array(full.prefix(entrypoint.count)) == entrypoint {
+            let rest = Array(full.dropFirst(entrypoint.count))
+            prefill.commandArgs = rest == cmd ? [] : rest
+        } else {
+            prefill.commandArgs = full == cmd ? [] : full
+        }
+
+        let imageEnv = Set(ociImage.config?.env ?? [])
+        prefill.customEnv = recordEnv.filter { !imageEnv.contains($0) }
+        return prefill
+    }
+}

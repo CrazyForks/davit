@@ -7,7 +7,12 @@ struct RunContainerSheet: View {
     @Environment(\.dismiss) private var dismiss
 
     var prefilledImage: String = ""
+    /// When set, the sheet edits this container's config and replaces it on Run.
+    var recreate: ContainerRecord? = nil
     var scrollable = true
+
+    @State private var originalCommandArgs: [String] = []
+    @State private var originalCommandDisplay = ""
 
     @State private var image = ""
     @State private var name = ""
@@ -24,7 +29,12 @@ struct RunContainerSheet: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack {
-                Text("Run Container").font(.title3.weight(.semibold))
+                Text(recreate == nil ? "Run Container" : "Recreate Container").font(.title3.weight(.semibold))
+                if let recreate {
+                    Text("replaces “\(recreate.id)”")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
                 Spacer()
             }
             .padding(20)
@@ -55,7 +65,7 @@ struct RunContainerSheet: View {
                     if running {
                         ProgressView().controlSize(.small)
                     } else {
-                        Text("Run")
+                        Text(recreate == nil ? "Run" : "Recreate")
                     }
                 }
                 .buttonStyle(.borderedProminent)
@@ -68,6 +78,40 @@ struct RunContainerSheet: View {
             image = prefilledImage
             if network.isEmpty || !state.networks.contains(where: { $0.name == network }) {
                 network = state.networks.first?.name ?? "default"
+            }
+            if let source = recreate {
+                prefill(from: source)
+            }
+        }
+    }
+
+    private func prefill(from source: ContainerRecord) {
+        image = source.imageReference
+        name = source.id
+        for port in source.configuration.publishedPorts ?? [] {
+            let proto = (port.proto ?? "tcp") == "tcp" ? "" : "/\(port.proto!)"
+            ports.append(KVPair(key: "\(port.hostPort ?? 0)", value: "\(port.containerPort ?? 0)\(proto)"))
+        }
+        for mount in source.configuration.mounts ?? [] {
+            volumeMounts.append(KVPair(key: mount.volumeName ?? mount.source ?? "", value: mount.destination ?? ""))
+        }
+        if let res = source.configuration.resources {
+            if let c = res.cpus { cpus = "\(c)" }
+            if let m = res.memoryInBytes {
+                memory = m % (1 << 30) == 0 ? "\(m >> 30)g" : "\(m >> 20)m"
+            }
+        }
+        if let net = source.status?.networks?.first?.network { network = net }
+
+        // Command + custom env need the image config; reconstructed off-thread.
+        Task {
+            let prefill = await ContainerService.recreatePrefill(for: source)
+            originalCommandArgs = prefill.commandArgs
+            originalCommandDisplay = prefill.commandArgs.joined(separator: " ")
+            command = originalCommandDisplay
+            for entry in prefill.customEnv {
+                let parts = entry.split(separator: "=", maxSplits: 1).map(String.init)
+                envVars.append(KVPair(key: parts.first ?? "", value: parts.count > 1 ? parts[1] : ""))
             }
         }
     }
@@ -165,11 +209,21 @@ struct RunContainerSheet: View {
         if !cpus.isEmpty { resourceArgs += ["--cpus", cpus] }
         if !memory.isEmpty { resourceArgs += ["--memory", memory] }
 
-        let commandArgs = command.isEmpty ? [] : command.split(separator: " ").map(String.init)
+        let commandArgs: [String]
+        if !originalCommandDisplay.isEmpty, command == originalCommandDisplay {
+            commandArgs = originalCommandArgs  // exact args, no whitespace re-splitting
+        } else {
+            commandArgs = command.isEmpty ? [] : command.split(separator: " ").map(String.init)
+        }
         let containerName = name
+        let replacing = recreate
 
         Task {
             do {
+                if let replacing {
+                    try? await ContainerService.stop(replacing.id)
+                    try await ContainerService.delete(replacing.id, force: true)
+                }
                 try await ContainerService.runContainer(
                     image: image,
                     name: containerName.isEmpty ? nil : containerName,

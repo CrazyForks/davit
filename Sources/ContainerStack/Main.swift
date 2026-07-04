@@ -135,6 +135,28 @@ enum SelfTest {
             try await ContainerService.stop("davit-selftest")
             try await ContainerService.delete("davit-selftest", force: true)
         }
+        await step("recreate prefill reconstruction") {
+            try await ContainerService.runContainer(
+                image: "alpine:latest",
+                name: "davit-recreate-test",
+                processArgs: ["--env", "FOO=bar"],
+                managementArgs: [],
+                resourceArgs: [],
+                commandArgs: ["sleep", "99"]
+            )
+            guard let record = try await ContainerService.listContainers().first(where: { $0.id == "davit-recreate-test" }) else {
+                throw CLIError(command: "selftest", message: "recreate-test container missing")
+            }
+            let prefill = await ContainerService.recreatePrefill(for: record)
+            try? await ContainerService.stop("davit-recreate-test")
+            try await ContainerService.delete("davit-recreate-test", force: true)
+            guard prefill.commandArgs == ["sleep", "99"] else {
+                throw CLIError(command: "selftest", message: "commandArgs reconstruction wrong: \(prefill.commandArgs)")
+            }
+            guard prefill.customEnv == ["FOO=bar"] else {
+                throw CLIError(command: "selftest", message: "customEnv reconstruction wrong: \(prefill.customEnv)")
+            }
+        }
         await step("config store round-trip") {
             let snap = try await SystemConfigStore.load()
             var edited = snap.effective

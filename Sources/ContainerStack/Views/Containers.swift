@@ -63,6 +63,9 @@ struct ContainersView: View {
             .sheet(isPresented: $showRunSheet) {
                 RunContainerSheet()
             }
+            .sheet(item: $state.recreateTarget) { target in
+                RunContainerSheet(recreate: target)
+            }
         }
     }
 
@@ -195,6 +198,7 @@ struct ContainerActions: View {
         } else {
             Button("Start") { state.startContainer(container) }
         }
+        Button("Edit & Recreate…") { state.recreateTarget = container }
         Divider()
         Button("Copy ID") {
             NSPasteboard.general.clearContents()

@@ -13,7 +13,7 @@ in-terminal shell (`davit exec`), and even launchd service bootstrap all go thro
 ## Features
 
 - **Dashboard** — service status with one-click start/stop, resource counts, disk usage with reclaimable-space cleanup menu, live aggregate CPU chart across running containers.
-- **Containers** — list with live CPU/memory/IP per row, start/stop/kill/restart/delete, prune, search. Detail view with:
+- **Containers** — list with live CPU/memory/IP per row, start/stop/kill/restart/delete, prune, search, and **Edit & Recreate** (containers are immutable on this platform, so "editing" opens the Run sheet prefilled with the container's ports/env/mounts/resources/network — with the image's entrypoint/CMD/env subtracted so only *your* customizations show — and replaces it on confirm). Detail view with:
   - *Overview*: image, command, platform, resources, network (IP/MAC/gateway/hostname), published ports with "Open in Browser", mounts, environment, labels.
   - *Logs*: streaming `-f` follow mode, boot-log toggle, tail selector, copy.
   - *Stats*: live CPU% and memory charts (Swift Charts), process count, network I/O.

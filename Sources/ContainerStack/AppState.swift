@@ -19,6 +19,7 @@ final class AppState: ObservableObject {
 
     // UI state
     @Published var busyIDs: Set<String> = []
+    @Published var recreateTarget: ContainerRecord?
     @Published var lastError: CLIError?
     @Published var isRefreshing = false
     @Published var initialLoadDone = false
