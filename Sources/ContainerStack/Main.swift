@@ -26,7 +26,18 @@ enum Main {
             Task.detached {
                 do {
                     if action == "install" {
-                        try await PlatformInstaller.install { print($0) }
+                        let lastDecile = Atomic(-1)
+                        try await PlatformInstaller.install { stage, fraction in
+                            if let fraction {
+                                let decile = Int(fraction * 10)
+                                if decile > lastDecile.value {
+                                    lastDecile.value = decile
+                                    print(stage)
+                                }
+                            } else {
+                                print(stage)
+                            }
+                        }
                         print("platform install: ok — \(PlatformInstaller.managedRoot)")
                     } else {
                         try PlatformInstaller.removeManaged()
@@ -151,6 +162,17 @@ enum SelfTest {
 
         print(failures == 0 ? "SELFTEST OK" : "SELFTEST FAILED (\(failures))")
         exit(failures == 0 ? 0 : 1)
+    }
+}
+
+/// Tiny lock-protected box for progress dedup in headless installs.
+final class Atomic: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _value: Int
+    init(_ value: Int) { _value = value }
+    var value: Int {
+        get { lock.lock(); defer { lock.unlock() }; return _value }
+        set { lock.lock(); defer { lock.unlock() }; _value = newValue }
     }
 }
 

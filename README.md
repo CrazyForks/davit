@@ -52,9 +52,13 @@ talks to. Davit resolves the platform install root in this order:
 4. vendored inside the app at `Davit.app/Contents/Resources/vendor`
 
 **In-app install:** when no platform is found, the onboarding screen offers one-click
-install — Davit downloads Apple's signed installer pkg, verifies the code signature,
-extracts the payload into the managed root (no administrator rights needed, unlike the
-official installer), and bootstraps the services from there. The managed copy sits
+install — Davit downloads Apple's signed installer pkg (with a live progress bar),
+verifies the code signature, extracts the payload into the managed root (no
+administrator rights needed, unlike the official installer), and bootstraps the
+services from there. Settings → General can then also install a `container` shell
+command: a wrapper in `/usr/local/bin` that pins `CONTAINER_INSTALL_ROOT` to the
+managed root before exec'ing the real CLI (one admin prompt; a bare symlink would be
+wrong, since the CLI derives its install root from the unresolved executable path). The managed copy sits
 above `/usr/local` in the resolution order on purpose: it always matches the client
 version the app links, so a newer system daemon can't break XPC compatibility.
 Also available headless: `Davit platform install|remove`.

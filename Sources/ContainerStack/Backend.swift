@@ -873,36 +873,39 @@ enum PlatformInstaller {
         FileManager.default.isExecutableFile(atPath: managedRoot + "/bin/container-apiserver")
     }
 
-    static func install(progress: @escaping @Sendable (String) -> Void) async throws {
+    /// progress: stage text + download fraction (nil while not downloading / size unknown)
+    static func install(progress: @escaping @Sendable (String, Double?) -> Void) async throws {
         let fm = FileManager.default
         let work = fm.temporaryDirectory.appendingPathComponent("davit-install-\(UUID().uuidString)")
         try fm.createDirectory(at: work, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: work) }
 
-        progress("Downloading container \(pinnedVersion) (~180 MB)…")
+        progress("Downloading container \(pinnedVersion)…", 0)
         let url = URL(string: "https://github.com/apple/container/releases/download/\(pinnedVersion)/container-\(pinnedVersion)-installer-signed.pkg")!
-        let (downloaded, response) = try await URLSession.shared.download(from: url)
-        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-            throw CLIError(command: "platform install", message: "download failed: HTTP \((response as? HTTPURLResponse)?.statusCode ?? -1)")
-        }
         let pkgPath = work.appendingPathComponent("container.pkg")
-        try fm.moveItem(at: downloaded, to: pkgPath)
+        try await downloadWithProgress(from: url, to: pkgPath) { fraction, receivedMB, totalMB in
+            if let totalMB {
+                progress(String(format: "Downloading container \(pinnedVersion)… %.0f of %.0f MB", receivedMB, totalMB), fraction)
+            } else {
+                progress(String(format: "Downloading container \(pinnedVersion)… %.0f MB", receivedMB), nil)
+            }
+        }
 
-        progress("Extracting installer payload…")
+        progress("Extracting installer payload…", nil)
         let expanded = work.appendingPathComponent("expanded")
         try await runTool("/usr/sbin/pkgutil", ["--expand-full", pkgPath.path, expanded.path])
         guard let payload = findPayload(in: expanded) else {
             throw CLIError(command: "platform install", message: "could not locate Payload in the installer package")
         }
 
-        progress("Verifying code signatures…")
+        progress("Verifying code signatures…", nil)
         let stagedAPIServer = payload.appendingPathComponent("bin/container-apiserver").path
         guard fm.isExecutableFile(atPath: stagedAPIServer) else {
             throw CLIError(command: "platform install", message: "payload is missing bin/container-apiserver")
         }
         try await runTool("/usr/bin/codesign", ["--verify", "--strict", stagedAPIServer])
 
-        progress("Installing to Application Support…")
+        progress("Installing to Application Support…", nil)
         // Clear quarantine so launchd can execute the extracted binaries.
         try? await runTool("/usr/bin/xattr", ["-dr", "com.apple.quarantine", payload.path])
         let root = managedRoot
@@ -915,7 +918,52 @@ enum PlatformInstaller {
         }
         // Point resolution at the managed root before any library API caches paths.
         setenv(InstallRoot.environmentName, root, 1)
-        progress("Installed to \(root)")
+        progress("Installed to \(root)", nil)
+    }
+
+    /// Streams a download to disk, reporting (fraction?, receivedMB, totalMB?) as it goes.
+    private static func downloadWithProgress(
+        from url: URL,
+        to destination: URL,
+        report: @escaping @Sendable (Double?, Double, Double?) -> Void
+    ) async throws {
+        let (bytes, response) = try await URLSession.shared.bytes(from: url)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw CLIError(command: "platform install", message: "download failed: HTTP \((response as? HTTPURLResponse)?.statusCode ?? -1)")
+        }
+        let total = response.expectedContentLength  // -1 when unknown
+        FileManager.default.createFile(atPath: destination.path, contents: nil)
+        let handle = try FileHandle(forWritingTo: destination)
+        defer { try? handle.close() }
+
+        var buffer = Data()
+        buffer.reserveCapacity(1 << 17)
+        var received: Int64 = 0
+        var lastReported: Int64 = 0
+        for try await byte in bytes {
+            buffer.append(byte)
+            if buffer.count >= 1 << 17 {
+                try handle.write(contentsOf: buffer)
+                received += Int64(buffer.count)
+                buffer.removeAll(keepingCapacity: true)
+                // report every ~2 MB to keep UI updates cheap
+                if received - lastReported >= 1 << 21 {
+                    lastReported = received
+                    let mb = Double(received) / 1_048_576
+                    if total > 0 {
+                        report(Double(received) / Double(total), mb, Double(total) / 1_048_576)
+                    } else {
+                        report(nil, mb, nil)
+                    }
+                }
+            }
+        }
+        if !buffer.isEmpty {
+            try handle.write(contentsOf: buffer)
+            received += Int64(buffer.count)
+        }
+        let mb = Double(received) / 1_048_576
+        report(1.0, mb, total > 0 ? Double(total) / 1_048_576 : mb)
     }
 
     /// Removes the managed install (containers/images are unaffected — they live in
@@ -937,36 +985,103 @@ enum PlatformInstaller {
         return nil
     }
 
-    /// Minimal runner for system tools (pkgutil/codesign/xattr) — not the container CLI.
+    /// Minimal runner for system tools (pkgutil/codesign/xattr/osascript) — not the
+    /// container CLI. Output goes to a temp file rather than a pipe: some of these
+    /// tools spawn XPC helpers (e.g. CSExattrCryptoService) that inherit a pipe's
+    /// write end and outlive the tool, so pipe-EOF never arrives and reads hang.
+    /// File-backed output + termination-driven completion has no such failure mode.
     @discardableResult
     static func runTool(_ path: String, _ args: [String]) async throws -> String {
+        let fm = FileManager.default
+        let outURL = fm.temporaryDirectory.appendingPathComponent("davit-tool-\(UUID().uuidString).out")
+        fm.createFile(atPath: outURL.path, contents: nil)
+        let outHandle = try FileHandle(forWritingTo: outURL)
+        defer {
+            try? outHandle.close()
+            try? fm.removeItem(at: outURL)
+        }
+
         let process = Process()
         process.executableURL = URL(fileURLWithPath: path)
         process.arguments = args
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = pipe
+        process.standardOutput = outHandle
+        process.standardError = outHandle
         process.standardInput = FileHandle.nullDevice
-        return try await withCheckedThrowingContinuation { cont in
+
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            process.terminationHandler = { _ in cont.resume() }
             do {
                 try process.run()
             } catch {
+                process.terminationHandler = nil
                 cont.resume(throwing: error)
-                return
-            }
-            DispatchQueue.global(qos: .userInitiated).async {
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                process.waitUntilExit()
-                let output = String(data: data, encoding: .utf8) ?? ""
-                if process.terminationStatus != 0 {
-                    cont.resume(throwing: CLIError(
-                        command: ([path] + args).joined(separator: " "),
-                        message: output.trimmingCharacters(in: .whitespacesAndNewlines),
-                        exitCode: process.terminationStatus))
-                } else {
-                    cont.resume(returning: output)
-                }
             }
         }
+
+        let output = (try? String(contentsOf: outURL, encoding: .utf8)) ?? ""
+        if process.terminationStatus != 0 {
+            throw CLIError(
+                command: ([path] + args).joined(separator: " "),
+                message: output.trimmingCharacters(in: .whitespacesAndNewlines),
+                exitCode: process.terminationStatus)
+        }
+        return output
+    }
+}
+
+// MARK: - Shell command installer (`container` in /usr/local/bin)
+
+/// Mimics the system install's shell experience for a Davit-managed platform:
+/// writes a wrapper at /usr/local/bin/container that pins CONTAINER_INSTALL_ROOT
+/// to the managed root and execs the real CLI. A plain symlink would be wrong —
+/// the CLI derives its install root from the (unresolved) executable path and
+/// would look for plugins under /usr/local. Requires one admin authorization.
+enum ShellCommandInstaller {
+    static let wrapperPath = "/usr/local/bin/container"
+    private static let marker = "installed by Davit (dev.wouter.davit)"
+
+    enum Status {
+        case installed          // our wrapper is in place
+        case foreignBinary      // a real system install (or something else) owns the path
+        case notInstalled
+    }
+
+    static var status: Status {
+        guard FileManager.default.fileExists(atPath: wrapperPath) else { return .notInstalled }
+        guard let content = try? String(contentsOfFile: wrapperPath, encoding: .utf8) else { return .foreignBinary }
+        return content.contains(marker) ? .installed : .foreignBinary
+    }
+
+    static func install(managedRoot: String) async throws {
+        let wrapper = """
+        #!/bin/sh
+        # \(marker) — points the container CLI at the Davit-managed platform install
+        export CONTAINER_INSTALL_ROOT="\(managedRoot)"
+        exec "\(managedRoot)/bin/container" "$@"
+        """
+        let temp = FileManager.default.temporaryDirectory.appendingPathComponent("davit-container-wrapper")
+        try wrapper.write(to: temp, atomically: true, encoding: .utf8)
+        try await runPrivileged("mkdir -p /usr/local/bin && install -m 0755 \(shellQuote(temp.path)) \(shellQuote(wrapperPath))")
+        try? FileManager.default.removeItem(at: temp)
+    }
+
+    static func uninstall() async throws {
+        guard status == .installed else { return }
+        try await runPrivileged("rm -f \(shellQuote(wrapperPath))")
+    }
+
+    private static func runPrivileged(_ command: String) async throws {
+        // osascript presents the standard macOS authorization dialog.
+        let escaped = command
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        try await PlatformInstaller.runTool(
+            "/usr/bin/osascript",
+            ["-e", "do shell script \"\(escaped)\" with administrator privileges"]
+        )
+    }
+
+    private static func shellQuote(_ s: String) -> String {
+        "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 }

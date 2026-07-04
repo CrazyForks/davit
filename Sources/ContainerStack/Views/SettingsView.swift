@@ -36,6 +36,11 @@ struct GeneralSettings: View {
                     Text("Container platform (container-apiserver) not found").foregroundStyle(.red)
                 }
             }
+            if state.resolvedBinary?.source == .managed {
+                Section("Command Line") {
+                    ShellCommandRow()
+                }
+            }
             Section("Refresh") {
                 Slider(value: $refreshInterval, in: 2...15, step: 1) {
                     Text("Refresh every \(Int(refreshInterval))s")
@@ -49,6 +54,60 @@ struct GeneralSettings: View {
         .padding()
         .onChange(of: binaryPath) {
             Task { await state.refreshAll() }
+        }
+    }
+}
+
+/// Installs/removes the `container` shell command for Davit-managed platforms.
+struct ShellCommandRow: View {
+    @EnvironmentObject var state: AppState
+    @State private var status = ShellCommandInstaller.status
+    @State private var working = false
+    @State private var errorText: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            switch status {
+            case .installed:
+                LabeledContent("`container` command") {
+                    Button("Remove from /usr/local/bin") { run { try await ShellCommandInstaller.uninstall() } }
+                        .disabled(working)
+                }
+                Text("Installed at /usr/local/bin/container, pointing at the Davit-managed platform.")
+                    .font(.caption).foregroundStyle(.secondary)
+            case .notInstalled:
+                LabeledContent("`container` command") {
+                    Button("Install in /usr/local/bin…") {
+                        guard let root = state.resolvedBinary?.installRoot else { return }
+                        run { try await ShellCommandInstaller.install(managedRoot: root) }
+                    }
+                    .disabled(working)
+                }
+                Text("Adds the `container` CLI to your shell, wired to the Davit-managed platform. Asks for administrator authorization once.")
+                    .font(.caption).foregroundStyle(.secondary)
+            case .foreignBinary:
+                Text("/usr/local/bin/container already exists (system install) — nothing to do.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            if let errorText {
+                Text(errorText).font(.caption).foregroundStyle(.red).textSelection(.enabled)
+            }
+        }
+    }
+
+    private func run(_ action: @escaping () async throws -> Void) {
+        working = true
+        errorText = nil
+        Task {
+            do {
+                try await action()
+            } catch {
+                // "User canceled" comes back from osascript when the auth dialog is dismissed
+                let message = error.localizedDescription
+                if !message.contains("-128") { errorText = message }
+            }
+            status = ShellCommandInstaller.status
+            working = false
         }
     }
 }

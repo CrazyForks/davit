@@ -129,6 +129,7 @@ struct OnboardingView: View {
     @AppStorage(ContainerBinary.defaultsKey) private var binaryPath = ""
     @State private var installing = false
     @State private var installStage = ""
+    @State private var installFraction: Double?
     @State private var installError: String?
 
     var body: some View {
@@ -144,10 +145,17 @@ struct OnboardingView: View {
 
             if installing {
                 VStack(spacing: 8) {
-                    ProgressView()
+                    if let fraction = installFraction {
+                        ProgressView(value: fraction)
+                            .progressViewStyle(.linear)
+                            .frame(width: 320)
+                    } else {
+                        ProgressView()
+                    }
                     Text(installStage)
                         .font(.callout)
                         .foregroundStyle(.secondary)
+                        .monospacedDigit()
                 }
                 .padding(.top, 4)
             } else {
@@ -195,10 +203,14 @@ struct OnboardingView: View {
         installError = nil
         Task {
             do {
-                try await PlatformInstaller.install { stage in
-                    Task { @MainActor in installStage = stage }
+                try await PlatformInstaller.install { stage, fraction in
+                    Task { @MainActor in
+                        installStage = stage
+                        installFraction = fraction
+                    }
                 }
                 installStage = "Starting container services…"
+                installFraction = nil
                 try await ContainerService.systemStart()
             } catch {
                 installError = error.localizedDescription
