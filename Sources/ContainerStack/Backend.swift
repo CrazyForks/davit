@@ -1,0 +1,849 @@
+import AppKit
+import ArgumentParser
+import ContainerAPIClient
+import ContainerizationOCI
+import ContainerPersistence
+import ContainerPlugin
+import ContainerResource
+import ContainerizationExtras
+import Foundation
+import Logging
+import SystemPackage
+import TerminalProgress
+
+// MARK: - Platform install resolution (replaces CLI binary resolution)
+
+/// Locates the container *platform* (container-apiserver + plugins). The app talks
+/// to the daemon over XPC via ContainerAPIClient; these binaries are only needed to
+/// bootstrap the launchd services. Resolution order:
+///   1. User-configured install root (Settings)
+///   2. System install (/usr/local — the official pkg)
+///   3. A copy vendored inside the app bundle (Contents/Resources/vendor)
+enum ContainerBinary {
+    static let defaultsKey = "containerInstallRoot"
+
+    static func resolve() -> ResolvedBinary? {
+        let custom = UserDefaults.standard.string(forKey: defaultsKey) ?? ""
+        var candidates: [(String, ResolvedBinary.Source)] = []
+        if !custom.isEmpty { candidates.append((custom, .userConfigured)) }
+        candidates.append(("/usr/local", .system))
+        if let res = Bundle.main.resourceURL {
+            candidates.append((res.appendingPathComponent("vendor").path, .bundled))
+        }
+        for (root, source) in candidates {
+            let apiserver = "\(root)/bin/container-apiserver"
+            if FileManager.default.isExecutableFile(atPath: apiserver) {
+                return ResolvedBinary(installRoot: root, apiserverPath: apiserver, source: source)
+            }
+        }
+        return nil
+    }
+
+    /// Must run before any ContainerAPIClient/ContainerPlugin API is touched:
+    /// InstallRoot.defaultPath is computed relative to the executable, which is wrong
+    /// inside an app bundle. Pin it (and let user config in app root win) via env.
+    static func bootstrapEnvironment() {
+        guard ProcessInfo.processInfo.environment[InstallRoot.environmentName] == nil,
+              let resolved = resolve() else { return }
+        setenv(InstallRoot.environmentName, resolved.installRoot, 1)
+    }
+}
+
+struct ResolvedBinary: Equatable {
+    enum Source: String { case userConfigured = "custom path", system = "system install", bundled = "bundled" }
+    let installRoot: String
+    let apiserverPath: String
+    let source: Source
+    var path: String { apiserverPath }
+}
+
+// MARK: - Errors
+
+struct CLIError: LocalizedError, Identifiable {
+    let id = UUID()
+    let command: String
+    let message: String
+    let exitCode: Int32
+
+    init(command: String, message: String, exitCode: Int32 = -1) {
+        self.command = command
+        self.message = message
+        self.exitCode = exitCode
+    }
+
+    var errorDescription: String? { message }
+
+    static func wrap(_ operation: String, _ error: Error) -> CLIError {
+        CLIError(command: operation, message: "\(operation): \(String(describing: error))")
+    }
+}
+
+// MARK: - Shared config / logging
+
+enum Backend {
+    static let log = Logger(label: "dev.wouter.davit")
+
+    static func systemConfig() async throws -> ContainerSystemConfig {
+        try await ConfigurationLoader.load(
+            configurationFiles: [
+                ConfigurationLoader.configurationFile(in: ApplicationRoot.path, of: .appRoot),
+                ConfigurationLoader.configurationFile(in: InstallRoot.path, of: .installRoot),
+            ])
+    }
+
+    static func prettyJSON<T: Encodable>(_ value: T) -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        guard let data = try? encoder.encode(value) else { return "{}" }
+        return String(data: data, encoding: .utf8) ?? "{}"
+    }
+}
+
+// MARK: - Typed service API (same facade as before, now XPC-backed)
+
+enum ContainerService {
+    // MARK: Listing
+
+    static func listContainers() async throws -> [ContainerRecord] {
+        let snapshots = try await ContainerClient().list()
+        return snapshots.map(ContainerRecord.init(snapshot:))
+    }
+
+    static func listImages() async throws -> [ImageRecord] {
+        let images = try await ClientImage.list()
+        var records: [ImageRecord] = []
+        for image in images {
+            // Hide infrastructure images (vminit, builder) like the CLI does.
+            if isInfraImage(image.reference) { continue }
+            records.append(await ImageRecord(client: image))
+        }
+        return records
+    }
+
+    static func isInfraImage(_ reference: String) -> Bool {
+        reference.contains("/containerization/vminit") || reference.contains("/container-builder-shim/")
+    }
+
+    static func listNetworks() async throws -> [NetworkRecord] {
+        try await NetworkClient().list().map(NetworkRecord.init(resource:))
+    }
+
+    static func listVolumes() async throws -> [VolumeRecord] {
+        try await ClientVolume.list().map(VolumeRecord.init(configuration:))
+    }
+
+    static func stats(for ids: [String]) async throws -> [StatsRecord] {
+        let client = ContainerClient()
+        return await withTaskGroup(of: StatsRecord?.self) { group in
+            for id in ids {
+                group.addTask {
+                    guard let s = try? await client.stats(id: id) else { return nil }
+                    return StatsRecord(stats: s)
+                }
+            }
+            var out: [StatsRecord] = []
+            for await record in group {
+                if let record { out.append(record) }
+            }
+            return out
+        }
+    }
+
+    static func diskUsage() async throws -> DiskUsage {
+        let df = try await ClientDiskUsage.get()
+        func map(_ u: ResourceUsage) -> DiskUsage.Section {
+            DiskUsage.Section(
+                total: u.total, active: u.active,
+                sizeInBytes: Int64(u.sizeInBytes), reclaimable: Int64(u.reclaimable))
+        }
+        return DiskUsage(containers: map(df.containers), images: map(df.images), volumes: map(df.volumes))
+    }
+
+    // MARK: Container lifecycle
+
+    static func start(_ id: String) async throws {
+        let client = ContainerClient()
+        let container = try await client.get(id: id)
+        guard container.status != .running else { return }
+        let io = try ProcessIO.create(tty: container.configuration.initProcess.terminal, interactive: false, detach: true)
+        do {
+            let process = try await client.bootstrap(id: id, stdio: io.stdio, dynamicEnv: [:])
+            try await process.start()
+            try io.closeAfterStart()
+        } catch {
+            try? io.close()
+            try? await client.stop(id: id)
+            throw CLIError.wrap("start \(id)", error)
+        }
+    }
+
+    static func stop(_ id: String) async throws {
+        try await ContainerClient().stop(id: id)
+    }
+
+    static func kill(_ id: String) async throws {
+        try await ContainerClient().kill(id: id, signal: "KILL")
+    }
+
+    static func restart(_ id: String) async throws {
+        try? await stop(id)
+        try await start(id)
+    }
+
+    static func delete(_ id: String, force: Bool) async throws {
+        try await ContainerClient().delete(id: id, force: force)
+    }
+
+    static func pruneContainers() async throws {
+        let client = ContainerClient()
+        for snapshot in try await client.list() where snapshot.status == .stopped {
+            try? await client.delete(id: snapshot.id, force: false)
+        }
+    }
+
+    static func stopAll() async throws {
+        let client = ContainerClient()
+        for snapshot in try await client.list() where snapshot.status == .running {
+            try? await client.stop(id: snapshot.id)
+        }
+    }
+
+    // MARK: Run (create + detached start)
+
+    static func runContainer(
+        image: String,
+        name: String?,
+        processArgs: [String],
+        managementArgs: [String],
+        resourceArgs: [String],
+        commandArgs: [String]
+    ) async throws {
+        do {
+            let config = try await Backend.systemConfig()
+            let id = Utility.createContainerID(name: name?.isEmpty == true ? nil : name)
+            try Utility.validEntityName(id)
+
+            let process = try Flags.Process.parse(processArgs)
+            let management = try Flags.Management.parse(managementArgs)
+            let resource = try Flags.Resource.parse(resourceArgs)
+            let registry = try Flags.Registry.parse([])
+            let imageFetch = try Flags.ImageFetch.parse([])
+
+            let (configuration, kernel, initImage) = try await Utility.containerConfigFromFlags(
+                id: id,
+                image: image,
+                arguments: commandArgs,
+                process: process,
+                management: management,
+                resource: resource,
+                registry: registry,
+                imageFetch: imageFetch,
+                containerSystemConfig: config,
+                progressUpdate: { _ in },
+                log: Backend.log
+            )
+
+            let client = ContainerClient()
+            try await client.create(
+                configuration: configuration,
+                options: ContainerCreateOptions(autoRemove: false),
+                kernel: kernel,
+                initImage: initImage
+            )
+            try await start(id)
+        } catch let e as CLIError {
+            throw e
+        } catch {
+            throw CLIError.wrap("run \(image)", error)
+        }
+    }
+
+    // MARK: Images
+
+    static func pullImage(_ reference: String, progress: @escaping @Sendable ([ProgressUpdateEvent]) async -> Void) async throws {
+        do {
+            let config = try await Backend.systemConfig()
+            _ = try await ClientImage.pull(
+                reference: reference,
+                containerSystemConfig: config,
+                progressUpdate: progress
+            )
+        } catch {
+            throw CLIError.wrap("pull \(reference)", error)
+        }
+    }
+
+    static func deleteImage(_ name: String) async throws {
+        do {
+            try await ClientImage.delete(reference: name, garbageCollect: true)
+        } catch {
+            throw CLIError.wrap("delete image \(name)", error)
+        }
+    }
+
+    static func pruneImages(all: Bool) async throws {
+        do {
+            let inUse = Set(try await ContainerClient().list().map { $0.configuration.image.reference })
+            for image in try await ClientImage.list() {
+                let ref = image.reference
+                if isInfraImage(ref) || inUse.contains(ref) { continue }
+                try? await ClientImage.delete(reference: ref, garbageCollect: false)
+            }
+            _ = try await ClientImage.cleanUpOrphanedBlobs()
+        } catch {
+            throw CLIError.wrap("prune images", error)
+        }
+    }
+
+    static func tagImage(_ source: String, _ target: String) async throws {
+        do {
+            let config = try await Backend.systemConfig()
+            let image = try await ClientImage.get(reference: source, containerSystemConfig: config)
+            let normalized = try ClientImage.normalizeReference(target, containerSystemConfig: config)
+            _ = try await image.tag(new: normalized)
+        } catch {
+            throw CLIError.wrap("tag \(source)", error)
+        }
+    }
+
+    // MARK: Volumes
+
+    static func createVolume(name: String, size: String?) async throws {
+        do {
+            var opts: [String: String] = [:]
+            if let size, !size.isEmpty { opts["size"] = size }
+            _ = try await ClientVolume.create(name: name, driverOpts: opts)
+        } catch {
+            throw CLIError.wrap("create volume \(name)", error)
+        }
+    }
+
+    static func deleteVolume(_ name: String) async throws {
+        do {
+            try await ClientVolume.delete(name: name)
+        } catch {
+            throw CLIError.wrap("delete volume \(name)", error)
+        }
+    }
+
+    static func pruneVolumes() async throws {
+        let used = usedVolumeNames(in: (try? await ContainerClient().list()) ?? [])
+        for volume in try await ClientVolume.list() where !used.contains(volume.name) {
+            try? await ClientVolume.delete(name: volume.name)
+        }
+    }
+
+    static func usedVolumeNames(in snapshots: [ContainerSnapshot]) -> Set<String> {
+        var used = Set<String>()
+        for snapshot in snapshots {
+            for mount in snapshot.configuration.mounts {
+                if let name = VolumeRecord.volumeName(fromSource: mount.source) {
+                    used.insert(name)
+                }
+            }
+        }
+        return used
+    }
+
+    // MARK: Networks
+
+    static func createNetwork(name: String, subnet: String?, internal isInternal: Bool) async throws {
+        do {
+            let cidr: CIDRv4? = try subnet.flatMap { $0.isEmpty ? nil : try CIDRv4($0) }
+            let configuration = try NetworkConfiguration(
+                name: name,
+                mode: isInternal ? .hostOnly : .nat,
+                ipv4Subnet: cidr,
+                plugin: "container-network-vmnet"
+            )
+            _ = try await NetworkClient().create(configuration: configuration)
+        } catch let e as CLIError {
+            throw e
+        } catch {
+            throw CLIError.wrap("create network \(name)", error)
+        }
+    }
+
+    static func deleteNetwork(_ name: String) async throws {
+        do {
+            try await NetworkClient().delete(id: name)
+        } catch {
+            throw CLIError.wrap("delete network \(name)", error)
+        }
+    }
+
+    static func pruneNetworks() async throws {
+        let snapshots = (try? await ContainerClient().list()) ?? []
+        var attached = Set<String>()
+        for snapshot in snapshots {
+            for net in snapshot.configuration.networks {
+                attached.insert(net.network)
+            }
+        }
+        for network in try await NetworkClient().list() where !network.isBuiltin && !attached.contains(network.name) {
+            try? await NetworkClient().delete(id: network.name)
+        }
+    }
+
+    // MARK: System
+
+    static func systemState() async throws -> SystemState {
+        do {
+            let health = try await ClientHealthCheck.ping(timeout: .seconds(3))
+            return .running(version: health.apiServerVersion)
+        } catch {
+            return .stopped
+        }
+    }
+
+    static func systemStart() async throws {
+        guard let resolved = ContainerBinary.resolve() else {
+            throw CLIError(command: "system start", message: "container platform not found — install it from https://github.com/apple/container/releases or vendor it into the app")
+        }
+        do {
+            try await SystemController.start(resolved: resolved)
+        } catch let e as CLIError {
+            throw e
+        } catch {
+            throw CLIError.wrap("system start", error)
+        }
+    }
+
+    static func systemStop() async throws {
+        do {
+            try await SystemController.stop()
+        } catch {
+            throw CLIError.wrap("system stop", error)
+        }
+    }
+
+    static func properties() async throws -> String {
+        let config = try await Backend.systemConfig()
+        return Backend.prettyJSON(config)
+    }
+
+    // MARK: Inspection
+
+    static func inspectRaw(_ kind: String, _ id: String) async throws -> String {
+        switch kind {
+        case "container":
+            let snapshot = try await ContainerClient().get(id: id)
+            return Backend.prettyJSON(snapshot)
+        case "image":
+            let config = try await Backend.systemConfig()
+            let image = try await ClientImage.get(reference: id, containerSystemConfig: config)
+            let index = try? await image.index()
+            struct Inspect: Encodable {
+                let description: ImageDescription
+                let index: ContainerizationOCI.Index?
+            }
+            return Backend.prettyJSON(Inspect(description: image.description, index: index))
+        case "network":
+            let network = try await NetworkClient().get(id: id)
+            return Backend.prettyJSON(network.configuration)
+        case "volume":
+            let volume = try await ClientVolume.inspect(id)
+            return Backend.prettyJSON(VolumeRecord(configuration: volume))
+        default:
+            return "{}"
+        }
+    }
+}
+
+// MARK: - System service bootstrap (what `container system start/stop` does, in-process)
+
+enum SystemController {
+    static let apiServerLabel = "com.apple.container.apiserver"
+    static let labelPrefix = "com.apple.container."
+
+    static func start(resolved: ResolvedBinary) async throws {
+        let appRoot = ApplicationRoot.path
+        try? ConfigurationLoader.copyConfigurationToReadOnly(to: appRoot)
+
+        // Resolve symlinks: launchd + amfid validate signatures against the real path.
+        let apiserverPath = try FilePath(resolved.apiserverPath).resolvingSymlinks()
+
+        let apiServerDataPath = appRoot.appending(FilePath.Component("apiserver"))
+        try FileManager.default.createDirectory(
+            at: URL(fileURLWithPath: apiServerDataPath.string), withIntermediateDirectories: true)
+
+        var env = PluginLoader.filterEnvironment()
+        env[ApplicationRoot.environmentName] = appRoot.string
+        env[InstallRoot.environmentName] = resolved.installRoot
+
+        let plist = LaunchPlist(
+            label: apiServerLabel,
+            arguments: [apiserverPath.string, "start"],
+            environment: env,
+            limitLoadToSessionType: [.Aqua, .Background, .System],
+            runAtLoad: true,
+            machServices: [apiServerLabel]
+        )
+        let plistPath = apiServerDataPath.appending(FilePath.Component("apiserver.plist"))
+        try plist.encode().write(to: URL(fileURLWithPath: plistPath.string))
+        try ServiceManager.register(plistPath: plistPath.string)
+
+        _ = try await ClientHealthCheck.ping(timeout: .seconds(20))
+
+        // Make sure the init filesystem and default kernel exist (non-interactive).
+        let config = try await Backend.systemConfig()
+        await ensureInitImage(config: config)
+        try await ensureKernel(config: config)
+    }
+
+    static func stop() async throws {
+        let domain = try ServiceManager.getDomainString()
+        let fullLabel = "\(domain)/\(apiServerLabel)"
+
+        if (try? await ClientHealthCheck.ping(timeout: .seconds(3))) != nil {
+            try? await ContainerService.stopAll()
+            // give containers a moment to exit before tearing the daemon down
+            for _ in 0..<10 {
+                let running = (try? await ContainerClient().list())?.contains { $0.status == .running } ?? false
+                if !running { break }
+                try? await Task.sleep(for: .seconds(1))
+            }
+            try? ServiceManager.deregister(fullServiceLabel: fullLabel)
+        }
+
+        try ServiceManager.enumerate()
+            .filter { $0.hasPrefix(labelPrefix) && $0 != apiServerLabel }
+            .forEach { try? ServiceManager.deregister(fullServiceLabel: "\(domain)/\($0)") }
+    }
+
+    private static func ensureInitImage(config: ContainerSystemConfig) async {
+        let reference = config.vminit.image
+        if (try? await ClientImage.get(reference: reference, containerSystemConfig: config)) != nil { return }
+        _ = try? await ClientImage.pull(reference: reference, containerSystemConfig: config)
+    }
+
+    private static func ensureKernel(config: ContainerSystemConfig) async throws {
+        if (try? await ClientKernel.getDefaultKernel(for: .current)) != nil { return }
+        // Download the recommended kernel archive and install it (mirrors --enable-kernel-install).
+        let (tempURL, _) = try await URLSession.shared.download(from: config.kernel.url)
+        let tarPath = tempURL.path + ".tar.zst"
+        try? FileManager.default.moveItem(atPath: tempURL.path, toPath: tarPath)
+        defer { try? FileManager.default.removeItem(atPath: tarPath) }
+        try await ClientKernel.installKernelFromTar(
+            tarFile: tarPath,
+            kernelFilePath: config.kernel.binaryPath,
+            platform: .current,
+            force: true
+        )
+    }
+}
+
+// MARK: - Terminal integration (self-exec: no CLI involved)
+
+enum TerminalLauncher {
+    /// Opens an interactive shell into a container in the user's default terminal.
+    /// The generated .command re-invokes the Davit binary in `exec` mode, which
+    /// attaches a TTY through the XPC API (see ExecMode in Main.swift).
+    static func openShell(containerID: String) {
+        let selfPath = Bundle.main.executablePath ?? CommandLine.arguments[0]
+        let escaped = containerID.replacingOccurrences(of: "'", with: "'\\''")
+        let script = """
+        #!/bin/sh
+        clear
+        printf '\\033]0;%s\\007' 'container: \(escaped)'
+        exec '\(selfPath)' exec '\(escaped)'
+        """
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("Davit", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = dir.appendingPathComponent("shell-\(containerID).command")
+        try? script.write(to: url, atomically: true, encoding: .utf8)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+        NSWorkspace.shared.open(url)
+    }
+}
+
+// MARK: - Log streaming (FileHandle-based, replaces `container logs -f`)
+
+final class LogStreamer: ObservableObject, @unchecked Sendable {
+    @Published var lines: [String] = []
+    @Published var isRunning = false
+
+    private let maxLines: Int
+    private var handle: FileHandle?
+    private var task: Task<Void, Never>?
+
+    init(maxLines: Int = 5000) {
+        self.maxLines = maxLines
+    }
+
+    func start(containerID: String, boot: Bool, follow: Bool, tail: Int) {
+        stop()
+        lines = []
+        isRunning = true
+        task = Task { [weak self] in
+            do {
+                let handles = try await ContainerClient().logs(id: containerID)
+                guard handles.count > (boot ? 1 : 0) else {
+                    await self?.finish(error: "no log stream available")
+                    return
+                }
+                let fh = boot ? handles[1] : handles[0]
+                await MainActor.run { self?.handle = fh }
+                let initial = Self.readTail(fh: fh, maxLines: tail > 0 ? tail : Int.max)
+                await self?.append(initial)
+                if follow {
+                    self?.follow(fh: fh)
+                } else {
+                    await self?.finish(error: nil)
+                }
+            } catch {
+                await self?.finish(error: "failed to open logs: \(error)")
+            }
+        }
+    }
+
+    func stop() {
+        task?.cancel()
+        task = nil
+        handle?.readabilityHandler = nil
+        try? handle?.close()
+        handle = nil
+        if isRunning { isRunning = false }
+    }
+
+    private func follow(fh: FileHandle) {
+        _ = try? fh.seekToEnd()
+        fh.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            let text = String(data: data, encoding: .utf8) ?? ""
+            let newLines = text.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
+            Task { @MainActor [weak self] in
+                self?.appendOnMain(newLines)
+            }
+        }
+    }
+
+    /// Reads the last `maxLines` lines of a log file without loading the whole file.
+    static func readTail(fh: FileHandle, maxLines: Int) -> [String] {
+        guard let size = try? fh.seekToEnd(), size > 0 else { return [] }
+        var offset = size
+        var buffer = Data()
+        var lines: [String] = []
+        while offset > 0 && lines.count < maxLines && buffer.count < 4_000_000 {
+            let readSize = min(65536, offset)
+            offset -= readSize
+            try? fh.seek(toOffset: offset)
+            buffer.insert(contentsOf: fh.readData(ofLength: Int(readSize)), at: 0)
+            if let chunk = String(data: buffer, encoding: .utf8) {
+                lines = chunk.components(separatedBy: .newlines).filter { !$0.isEmpty }
+            }
+        }
+        return Array(lines.suffix(maxLines))
+    }
+
+    @MainActor
+    private func appendOnMain(_ new: [String]) {
+        lines.append(contentsOf: new)
+        if lines.count > maxLines { lines.removeFirst(lines.count - maxLines) }
+    }
+
+    private func append(_ new: [String]) async {
+        await MainActor.run { self.appendOnMain(new) }
+    }
+
+    private func finish(error: String?) async {
+        await MainActor.run {
+            if let error { self.lines.append("⚠︎ \(error)") }
+            self.isRunning = false
+        }
+    }
+
+    deinit {
+        handle?.readabilityHandler = nil
+        try? handle?.close()
+    }
+}
+
+// MARK: - Pull progress (replaces streamed CLI output)
+
+@MainActor
+final class PullProgressModel: ObservableObject {
+    @Published var lines: [String] = []
+    @Published var isRunning = false
+    @Published var succeeded: Bool?
+
+    private var task: Task<Void, Never>?
+    private var currentDescription = ""
+
+    func start(reference: String) {
+        task?.cancel()
+        lines = []
+        succeeded = nil
+        isRunning = true
+        task = Task {
+            do {
+                try await ContainerService.pullImage(reference) { [weak self] events in
+                    await self?.consume(events)
+                }
+                self.lines.append("✓ pull complete")
+                self.succeeded = true
+            } catch {
+                self.lines.append("✗ \(error.localizedDescription)")
+                self.succeeded = false
+            }
+            self.isRunning = false
+        }
+    }
+
+    func cancel() {
+        task?.cancel()
+        task = nil
+        isRunning = false
+    }
+
+    private func consume(_ events: [ProgressUpdateEvent]) {
+        for event in events {
+            switch event {
+            case .setDescription(let text):
+                if text != currentDescription {
+                    currentDescription = text
+                    lines.append(text)
+                }
+            case .setSubDescription(let text):
+                lines.append("  \(text)")
+            default:
+                break
+            }
+        }
+        if lines.count > 500 { lines.removeFirst(lines.count - 500) }
+    }
+}
+
+// MARK: - System configuration store (writes ~/.config/container/config.toml)
+
+/// Edits the container platform's user configuration. Values layer as:
+/// user config (~/.config/container/config.toml) → install defaults
+/// (<installRoot>/etc/container/config.toml) → code defaults. On save, only keys
+/// that differ from the defaults are written, `[plugin.*]` sections in an existing
+/// user file are preserved verbatim, and the result is validated by the real
+/// loader before being published to the app root.
+enum SystemConfigStore {
+    struct Snapshot {
+        /// section → key → scalar (from JSON encoding of ContainerSystemConfig)
+        var effective: [String: [String: Any]]
+        var defaults: [String: [String: Any]]
+    }
+
+    static var homeConfigPath: FilePath {
+        ConfigurationLoader.configurationFile(.home)
+    }
+
+    static func load() async throws -> Snapshot {
+        let effective = try await Backend.systemConfig()
+        let defaults: ContainerSystemConfig
+        do {
+            defaults = try await ConfigurationLoader.load(
+                configurationFiles: [ConfigurationLoader.configurationFile(in: InstallRoot.path, of: .installRoot)])
+        } catch {
+            defaults = ContainerSystemConfig()
+        }
+        return Snapshot(effective: try dictionary(of: effective), defaults: try dictionary(of: defaults))
+    }
+
+    /// Persist `edited` (full effective values): diffs against defaults, writes TOML,
+    /// validates, publishes to the app root so client-side loads pick it up immediately.
+    static func save(edited: [String: [String: Any]], defaults: [String: [String: Any]]) async throws {
+        var toml = "# User overrides for Apple's container platform.\n# Managed by Davit — edits made here are preserved only for [plugin.*] sections.\n"
+        var wroteAny = false
+        for section in edited.keys.sorted() {
+            guard let values = edited[section] else { continue }
+            let defaultValues = defaults[section] ?? [:]
+            var lines: [String] = []
+            for key in values.keys.sorted() {
+                let value = values[key]!
+                if value is NSNull { continue }
+                if let def = defaultValues[key], scalarEqual(def, value) { continue }
+                guard let rendered = tomlScalar(value) else { continue }
+                lines.append("\(key) = \(rendered)")
+            }
+            if !lines.isEmpty {
+                toml += "\n[\(section)]\n" + lines.joined(separator: "\n") + "\n"
+                wroteAny = true
+            }
+        }
+
+        // Preserve [plugin.*] sections from the existing user file.
+        let path = homeConfigPath.string
+        if let existing = try? String(contentsOfFile: path, encoding: .utf8) {
+            let pluginBlocks = pluginSections(in: existing)
+            if !pluginBlocks.isEmpty {
+                toml += "\n" + pluginBlocks.joined(separator: "\n") + "\n"
+                wroteAny = true
+            }
+        }
+
+        let fm = FileManager.default
+        if !wroteAny {
+            // No overrides at all: remove the user file so defaults fully apply.
+            try? fm.removeItem(atPath: path)
+        } else {
+            // Validate through the real loader before committing.
+            let tempPath = fm.temporaryDirectory.appendingPathComponent("davit-config-\(UUID().uuidString).toml").path
+            try toml.write(toFile: tempPath, atomically: true, encoding: .utf8)
+            defer { try? fm.removeItem(atPath: tempPath) }
+            do {
+                _ = try await ConfigurationLoader.load(configurationFiles: [FilePath(tempPath)])
+            } catch {
+                throw CLIError(command: "save settings", message: "invalid configuration: \(error)")
+            }
+            try fm.createDirectory(
+                atPath: homeConfigPath.removingLastComponent().string, withIntermediateDirectories: true)
+            try toml.write(toFile: path, atomically: true, encoding: .utf8)
+        }
+
+        // Publish to <appRoot>/config/config.toml (normally done at service start).
+        try ConfigurationLoader.copyConfigurationToReadOnly()
+    }
+
+    // MARK: helpers
+
+    private static func dictionary(of config: ContainerSystemConfig) throws -> [String: [String: Any]] {
+        let data = try JSONEncoder().encode(config)
+        let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
+        return obj.mapValues { $0 as? [String: Any] ?? [:] }
+    }
+
+    private static func scalarEqual(_ a: Any, _ b: Any) -> Bool {
+        (a as? NSObject)?.isEqual(b) ?? false
+    }
+
+    private static func tomlScalar(_ value: Any) -> String? {
+        switch value {
+        case let n as NSNumber:
+            // NSNumber bridges bools too; distinguish via the ObjC type encoding.
+            if String(cString: n.objCType) == "c" { return n.boolValue ? "true" : "false" }
+            if n.doubleValue == n.doubleValue.rounded() { return "\(n.int64Value)" }
+            return "\(n.doubleValue)"
+        case let s as String:
+            let escaped = s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+            return "\"\(escaped)\""
+        default:
+            return nil
+        }
+    }
+
+    private static func pluginSections(in toml: String) -> [String] {
+        var blocks: [String] = []
+        var current: [String] = []
+        var inPlugin = false
+        for line in toml.components(separatedBy: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("[") {
+                if inPlugin, !current.isEmpty { blocks.append(current.joined(separator: "\n")) }
+                inPlugin = trimmed.hasPrefix("[plugin.") || trimmed.hasPrefix("[plugin]")
+                current = inPlugin ? [line] : []
+            } else if inPlugin {
+                current.append(line)
+            }
+        }
+        if inPlugin, !current.isEmpty { blocks.append(current.joined(separator: "\n")) }
+        return blocks
+    }
+}

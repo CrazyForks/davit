@@ -1,0 +1,179 @@
+import AppKit
+import ContainerAPIClient
+import ContainerResource
+import Foundation
+
+/// Entry point. Normally launches the SwiftUI app; `davit exec <container-id>`
+/// instead attaches an interactive TTY shell to a container over the XPC API —
+/// this is what the "Open Terminal" .command file invokes, so no `container`
+/// CLI is needed anywhere.
+@main
+enum Main {
+    static func main() {
+        ContainerBinary.bootstrapEnvironment()
+        let args = CommandLine.arguments
+        if args.count >= 3, args[1] == "exec" {
+            ExecMode.runBlocking(containerID: args[2])
+            return
+        }
+        if args.count >= 2, args[1] == "selftest" {
+            SelfTest.runBlocking()
+            return
+        }
+        if args.count >= 3, args[1] == "system", args[2] == "start" || args[2] == "stop" {
+            let action = args[2]
+            let semaphore = DispatchSemaphore(value: 0)
+            Task.detached {
+                do {
+                    if action == "start" {
+                        try await ContainerService.systemStart()
+                    } else {
+                        try await ContainerService.systemStop()
+                    }
+                    print("system \(action): ok")
+                    exit(0)
+                } catch {
+                    FileHandle.standardError.write(Data("system \(action) failed: \(error)\n".utf8))
+                    exit(1)
+                }
+            }
+            semaphore.wait()
+            return
+        }
+        ContainerStackApp.main()
+    }
+}
+
+/// `davit selftest` — exercises the XPC-backed service layer end to end against
+/// the live daemon: lists, volume create/delete, container run/stop/start/delete.
+enum SelfTest {
+    static func runBlocking() {
+        let semaphore = DispatchSemaphore(value: 0)
+        Task.detached {
+            await run()
+            semaphore.signal()
+        }
+        semaphore.wait()
+    }
+
+    static func run() async {
+        var failures = 0
+        func step(_ name: String, _ body: () async throws -> Void) async {
+            do {
+                try await body()
+                print("PASS \(name)")
+            } catch {
+                failures += 1
+                print("FAIL \(name): \(error)")
+            }
+        }
+
+        await step("system state") {
+            let state = try await ContainerService.systemState()
+            guard state.isRunning else { throw CLIError(command: "selftest", message: "services not running") }
+        }
+        await step("list containers/images/volumes/networks/df") {
+            _ = try await ContainerService.listContainers()
+            _ = try await ContainerService.listImages()
+            _ = try await ContainerService.listVolumes()
+            _ = try await ContainerService.listNetworks()
+            _ = try await ContainerService.diskUsage()
+        }
+        await step("volume create+delete") {
+            try await ContainerService.createVolume(name: "davit-selftest-vol", size: nil)
+            let names = try await ContainerService.listVolumes().map(\.name)
+            guard names.contains("davit-selftest-vol") else { throw CLIError(command: "selftest", message: "volume missing after create") }
+            try await ContainerService.deleteVolume("davit-selftest-vol")
+        }
+        await step("container run→stats→stop→start→delete") {
+            try await ContainerService.runContainer(
+                image: "alpine:latest",
+                name: "davit-selftest",
+                processArgs: ["--env", "DAVIT=1"],
+                managementArgs: [],
+                resourceArgs: ["--cpus", "1", "--memory", "256m"],
+                commandArgs: ["sleep", "120"]
+            )
+            let running = try await ContainerService.listContainers().first { $0.id == "davit-selftest" }
+            guard running?.isRunning == true else { throw CLIError(command: "selftest", message: "container not running after run") }
+            let stats = try await ContainerService.stats(for: ["davit-selftest"])
+            guard !stats.isEmpty else { throw CLIError(command: "selftest", message: "no stats") }
+            try await ContainerService.stop("davit-selftest")
+            try await ContainerService.start("davit-selftest")
+            try await ContainerService.stop("davit-selftest")
+            try await ContainerService.delete("davit-selftest", force: true)
+        }
+        await step("config store round-trip") {
+            let snap = try await SystemConfigStore.load()
+            var edited = snap.effective
+            edited["dns", default: [:]]["domain"] = "davit-selftest.test"
+            try await SystemConfigStore.save(edited: edited, defaults: snap.defaults)
+
+            let reloaded = try await SystemConfigStore.load()
+            guard reloaded.effective["dns"]?["domain"] as? String == "davit-selftest.test" else {
+                throw CLIError(command: "selftest", message: "saved override not visible after reload")
+            }
+            // Revert: saving pure effective==defaults removes the override file again.
+            var reverted = reloaded.effective
+            reverted["dns"]?["domain"] = NSNull()
+            try await SystemConfigStore.save(edited: reverted, defaults: reloaded.defaults)
+            let final = try await SystemConfigStore.load()
+            guard final.effective["dns"]?["domain"] == nil || final.effective["dns"]?["domain"] is NSNull else {
+                throw CLIError(command: "selftest", message: "override not removed on revert")
+            }
+        }
+        await step("inspect container JSON") {
+            guard let first = try await ContainerService.listContainers().first else { return }
+            let json = try await ContainerService.inspectRaw("container", first.id)
+            guard json.contains("\"id\"") else { throw CLIError(command: "selftest", message: "bad inspect output") }
+        }
+
+        print(failures == 0 ? "SELFTEST OK" : "SELFTEST FAILED (\(failures))")
+        exit(failures == 0 ? 0 : 1)
+    }
+}
+
+enum ExecMode {
+    static func runBlocking(containerID: String) {
+        let semaphore = DispatchSemaphore(value: 0)
+        Task.detached {
+            await run(containerID: containerID)
+            semaphore.signal()
+        }
+        semaphore.wait()
+    }
+
+    static func run(containerID: String) async {
+        do {
+            let client = ContainerClient()
+            let container = try await client.get(id: containerID)
+            guard container.status == .running else {
+                FileHandle.standardError.write(Data("container \(containerID) is not running\n".utf8))
+                exit(1)
+            }
+
+            // Base the exec process on the container's init process (env, user, cwd),
+            // the same way `container exec` does.
+            var config = container.configuration.initProcess
+            config.executable = "/bin/sh"
+            config.arguments = ["-c", "command -v bash >/dev/null 2>&1 && exec bash || exec sh"]
+            config.terminal = true
+            config.environment.append("TERM=xterm-256color")
+
+            let io = try ProcessIO.create(tty: true, interactive: true, detach: false)
+            defer { try? io.close() }
+
+            let process = try await client.createProcess(
+                containerId: containerID,
+                processId: UUID().uuidString.lowercased(),
+                configuration: config,
+                stdio: io.stdio
+            )
+            let code = try await io.handleProcess(process: process, log: Backend.log)
+            exit(code)
+        } catch {
+            FileHandle.standardError.write(Data("exec failed: \(error)\n".utf8))
+            exit(1)
+        }
+    }
+}

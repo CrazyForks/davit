@@ -1,0 +1,419 @@
+import SwiftUI
+import Charts
+
+struct ContainerDetailView: View {
+    @EnvironmentObject var state: AppState
+    @Environment(\.dismiss) private var dismiss
+    let containerID: String
+
+    enum Tab: String, CaseIterable {
+        case overview = "Overview"
+        case logs = "Logs"
+        case stats = "Stats"
+        case inspect = "Inspect"
+    }
+    @State private var tab: Tab = .overview
+
+    private var container: ContainerRecord? {
+        state.containers.first { $0.id == containerID }
+    }
+
+    var body: some View {
+        Group {
+            if let container {
+                VStack(spacing: 0) {
+                    header(container)
+                    Divider()
+                    tabContent(container)
+                }
+            } else {
+                EmptyState(icon: "shippingbox", title: "Container removed",
+                           message: "This container no longer exists.")
+            }
+        }
+        .navigationTitle(containerID)
+        .toolbar {
+            if let container {
+                ToolbarItemGroup(placement: .primaryAction) {
+                    if state.busyIDs.contains(container.id) {
+                        ProgressView().controlSize(.small)
+                    }
+                    if container.isRunning {
+                        Button { state.stopContainer(container) } label: {
+                            Label("Stop", systemImage: "stop.fill")
+                        }.help("Stop")
+                        Button { state.restartContainer(container) } label: {
+                            Label("Restart", systemImage: "arrow.clockwise")
+                        }.help("Restart")
+                        Button { TerminalLauncher.openShell(containerID: container.id) } label: {
+                            Label("Terminal", systemImage: "terminal")
+                        }.help("Open shell in Terminal")
+                    } else {
+                        Button { state.startContainer(container) } label: {
+                            Label("Start", systemImage: "play.fill")
+                        }.help("Start")
+                    }
+                    Menu {
+                        ContainerActions(container: container)
+                    } label: {
+                        Label("More", systemImage: "ellipsis.circle")
+                    }
+                }
+            }
+        }
+    }
+
+    private func header(_ c: ContainerRecord) -> some View {
+        HStack(spacing: 14) {
+            StatusDot(color: c.state.color, pulsing: c.isRunning)
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 10) {
+                    Text(c.id).font(.title2.weight(.semibold))
+                    StateChip(state: c.state)
+                }
+                Text(c.shortImage).foregroundStyle(.secondary)
+            }
+            Spacer()
+            Picker("", selection: $tab) {
+                ForEach(Tab.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            .frame(width: 340)
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 14)
+    }
+
+    @ViewBuilder
+    private func tabContent(_ c: ContainerRecord) -> some View {
+        switch tab {
+        case .overview: ContainerOverviewTab(container: c)
+        case .logs: ContainerLogsTab(containerID: c.id)
+        case .stats: ContainerStatsTab(container: c)
+        case .inspect: InspectTab(kind: "container", id: c.id)
+        }
+    }
+}
+
+// MARK: - Overview tab
+
+struct ContainerOverviewTab: View {
+    let container: ContainerRecord
+    var scrollable = true
+
+    var body: some View {
+        Group {
+            if scrollable {
+                ScrollView { content }
+            } else {
+                content
+            }
+        }
+    }
+
+    private var content: some View {
+            VStack(spacing: 14) {
+                DetailCard(title: "General", icon: "info.circle") {
+                    InfoRow(label: "ID", value: container.id, monospaced: true, copyable: true)
+                    InfoRow(label: "Image", value: container.imageReference, monospaced: true, copyable: true)
+                    if !container.command.isEmpty {
+                        InfoRow(label: "Command", value: container.command, monospaced: true)
+                    }
+                    InfoRow(label: "Platform", value: container.configuration.platform?.display ?? "—")
+                    InfoRow(label: "Created", value: absoluteAndRelative(container.created))
+                    if container.isRunning {
+                        InfoRow(label: "Started", value: absoluteAndRelative(container.started))
+                    }
+                    if let res = container.configuration.resources {
+                        InfoRow(label: "Resources",
+                                value: "\(res.cpus ?? 0) CPUs · \(formatBytes(res.memoryInBytes)) memory")
+                    }
+                }
+
+                if let nets = container.status?.networks, !nets.isEmpty {
+                    DetailCard(title: "Network", icon: "network") {
+                        ForEach(nets, id: \.self) { net in
+                            if let ip = net.ipv4Address {
+                                InfoRow(label: "IPv4", value: ip, monospaced: true, copyable: true)
+                            }
+                            if let gw = net.ipv4Gateway {
+                                InfoRow(label: "Gateway", value: gw, monospaced: true)
+                            }
+                            if let mac = net.macAddress {
+                                InfoRow(label: "MAC", value: mac, monospaced: true)
+                            }
+                            if let host = net.hostname {
+                                InfoRow(label: "Hostname", value: host, monospaced: true)
+                            }
+                            InfoRow(label: "Network", value: net.network ?? "default")
+                        }
+                    }
+                }
+
+                if let ports = container.configuration.publishedPorts, !ports.isEmpty {
+                    DetailCard(title: "Published Ports", icon: "arrow.left.arrow.right") {
+                        ForEach(ports, id: \.self) { port in
+                            HStack {
+                                Text(port.display)
+                                    .font(.system(.callout, design: .monospaced))
+                                Spacer()
+                                Button("Open in Browser") {
+                                    NSWorkspace.shared.open(URL(string: "http://localhost:\(port.hostPort ?? 0)")!)
+                                }
+                                .controlSize(.small)
+                            }
+                        }
+                    }
+                }
+
+                if let mounts = container.configuration.mounts, !mounts.isEmpty {
+                    DetailCard(title: "Mounts", icon: "externaldrive") {
+                        ForEach(mounts, id: \.self) { m in
+                            HStack(spacing: 8) {
+                                Text(m.kindLabel)
+                                    .font(.caption.weight(.medium))
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .background(.purple.opacity(0.12), in: Capsule())
+                                    .foregroundStyle(.purple)
+                                Text("\(m.displaySource) → \(m.destination ?? "—")")
+                                    .font(.system(.callout, design: .monospaced))
+                                    .textSelection(.enabled)
+                            }
+                        }
+                    }
+                }
+
+                if let env = container.configuration.initProcess?.environment, !env.isEmpty {
+                    DetailCard(title: "Environment", icon: "list.bullet.rectangle") {
+                        ForEach(env, id: \.self) { e in
+                            Text(e)
+                                .font(.system(.callout, design: .monospaced))
+                                .textSelection(.enabled)
+                        }
+                    }
+                }
+
+                if let labels = container.configuration.labels, !labels.isEmpty {
+                    DetailCard(title: "Labels", icon: "tag") {
+                        ForEach(labels.sorted(by: { $0.key < $1.key }), id: \.key) { k, v in
+                            InfoRow(label: k, value: v, monospaced: true)
+                        }
+                    }
+                }
+            }
+            .padding(16)
+    }
+
+    private func absoluteAndRelative(_ date: Date?) -> String {
+        guard let date else { return "—" }
+        return "\(date.formatted(date: .abbreviated, time: .shortened)) (\(relativeDate(date)))"
+    }
+}
+
+// MARK: - Logs tab
+
+struct ContainerLogsTab: View {
+    let containerID: String
+    @StateObject private var streamer = LogStreamer()
+    @State private var follow = true
+    @State private var bootLogs = false
+    @State private var tailCount = 500
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 14) {
+                Toggle("Follow", isOn: $follow)
+                    .toggleStyle(.checkbox)
+                Toggle("Boot log", isOn: $bootLogs)
+                    .toggleStyle(.checkbox)
+                Picker("Tail", selection: $tailCount) {
+                    Text("200").tag(200)
+                    Text("500").tag(500)
+                    Text("2000").tag(2000)
+                    Text("All").tag(0)
+                }
+                .pickerStyle(.menu)
+                .fixedSize()
+                Spacer()
+                if streamer.isRunning {
+                    HStack(spacing: 5) {
+                        ProgressView().controlSize(.mini)
+                        Text("streaming").font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                Button {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(streamer.lines.joined(separator: "\n"), forType: .string)
+                } label: {
+                    Label("Copy", systemImage: "doc.on.doc")
+                }
+                .controlSize(.small)
+                Button {
+                    restart()
+                } label: {
+                    Label("Reload", systemImage: "arrow.clockwise")
+                }
+                .controlSize(.small)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            Divider()
+
+            if streamer.lines.isEmpty && !streamer.isRunning {
+                EmptyState(icon: "text.alignleft", title: "No log output",
+                           message: "This container hasn't produced any output yet.")
+            } else {
+                ConsoleView(lines: streamer.lines, autoScroll: follow)
+            }
+        }
+        .onAppear { restart() }
+        .onDisappear { streamer.stop() }
+        .onChange(of: bootLogs) { restart() }
+        .onChange(of: follow) { restart() }
+        .onChange(of: tailCount) { restart() }
+    }
+
+    private func restart() {
+        streamer.start(containerID: containerID, boot: bootLogs, follow: follow, tail: tailCount)
+    }
+}
+
+// MARK: - Stats tab
+
+struct ContainerStatsTab: View {
+    @EnvironmentObject var state: AppState
+    let container: ContainerRecord
+    var scrollable = true
+
+    private var history: [StatsSample] { state.statsHistory[container.id] ?? [] }
+    private var latest: StatsSample? { history.last }
+
+    var body: some View {
+        if !container.isRunning {
+            EmptyState(icon: "chart.xyaxis.line", title: "Container not running",
+                       message: "Start the container to see live resource usage.")
+        } else if history.count < 2 {
+            VStack(spacing: 10) {
+                ProgressView()
+                Text("Collecting stats…").foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if scrollable {
+            ScrollView { statsContent }
+        } else {
+            statsContent
+        }
+    }
+
+    private var statsContent: some View {
+                VStack(spacing: 14) {
+                    HStack(spacing: 14) {
+                        StatTile(title: "CPU",
+                                 value: String(format: "%.1f%%", latest?.cpuPercent ?? 0),
+                                 subtitle: "\(container.configuration.resources?.cpus ?? 0) CPUs allocated")
+                        StatTile(title: "Memory",
+                                 value: formatBytes(latest?.memoryBytes),
+                                 subtitle: "limit \(formatBytes(latest?.memoryLimit))")
+                        StatTile(title: "Processes",
+                                 value: "\(latest?.processes ?? 0)",
+                                 subtitle: "running")
+                        StatTile(title: "Network",
+                                 value: "↓ \(formatBytes(latest?.rxBytes))",
+                                 subtitle: "↑ \(formatBytes(latest?.txBytes))")
+                    }
+
+                    DetailCard(title: "CPU Usage", icon: "cpu") {
+                        Chart(history) { sample in
+                            LineMark(x: .value("Time", sample.time), y: .value("CPU %", sample.cpuPercent))
+                                .interpolationMethod(.monotone)
+                            AreaMark(x: .value("Time", sample.time), y: .value("CPU %", sample.cpuPercent))
+                                .interpolationMethod(.monotone)
+                                .foregroundStyle(.linearGradient(
+                                    colors: [.accentColor.opacity(0.25), .clear],
+                                    startPoint: .top, endPoint: .bottom))
+                        }
+                        .chartYAxisLabel("%")
+                        .chartYScale(domain: 0...max(10, (history.map(\.cpuPercent).max() ?? 10) * 1.2))
+                        .frame(height: 160)
+                    }
+
+                    DetailCard(title: "Memory Usage", icon: "memorychip") {
+                        Chart(history) { sample in
+                            LineMark(x: .value("Time", sample.time),
+                                     y: .value("MB", Double(sample.memoryBytes) / 1_048_576))
+                                .interpolationMethod(.monotone)
+                                .foregroundStyle(.purple)
+                            AreaMark(x: .value("Time", sample.time),
+                                     y: .value("MB", Double(sample.memoryBytes) / 1_048_576))
+                                .interpolationMethod(.monotone)
+                                .foregroundStyle(.linearGradient(
+                                    colors: [.purple.opacity(0.25), .clear],
+                                    startPoint: .top, endPoint: .bottom))
+                        }
+                        .chartYAxisLabel("MB")
+                        .frame(height: 160)
+                    }
+                }
+                .padding(16)
+    }
+}
+
+struct StatTile: View {
+    let title: String
+    let value: String
+    let subtitle: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+            Text(value).font(.system(.title2, design: .rounded).weight(.semibold))
+            Text(subtitle).font(.caption).foregroundStyle(.tertiary)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.background.secondary, in: RoundedRectangle(cornerRadius: 10))
+    }
+}
+
+// MARK: - Inspect tab (shared with images/networks/volumes)
+
+struct InspectTab: View {
+    let kind: String
+    let id: String
+    @State private var json: String = ""
+    @State private var loading = true
+
+    var body: some View {
+        Group {
+            if loading {
+                ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView([.vertical, .horizontal]) {
+                    Text(json)
+                        .font(.system(size: 11.5, design: .monospaced))
+                        .textSelection(.enabled)
+                        .padding(12)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .background(Color(nsColor: .textBackgroundColor))
+            }
+        }
+        .task(id: id) {
+            loading = true
+            json = (try? await ContainerService.inspectRaw(kind, id)) ?? "Failed to inspect \(id)"
+            loading = false
+        }
+        .toolbar {
+            ToolbarItem {
+                Button {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(json, forType: .string)
+                } label: {
+                    Label("Copy JSON", systemImage: "doc.on.doc")
+                }
+                .disabled(loading)
+            }
+        }
+    }
+}

@@ -1,0 +1,339 @@
+import SwiftUI
+
+// MARK: - Run container sheet
+
+struct RunContainerSheet: View {
+    @EnvironmentObject var state: AppState
+    @Environment(\.dismiss) private var dismiss
+
+    var prefilledImage: String = ""
+    var scrollable = true
+
+    @State private var image = ""
+    @State private var name = ""
+    @State private var command = ""
+    @State private var ports: [KVPair] = []      // key = host port, value = container port
+    @State private var envVars: [KVPair] = []
+    @State private var volumeMounts: [KVPair] = []  // key = volume name or host path, value = container path
+    @State private var network = "default"
+    @State private var cpus = ""
+    @State private var memory = ""
+    @State private var running = false
+    @State private var errorText: String?
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Run Container").font(.title3.weight(.semibold))
+                Spacer()
+            }
+            .padding(20)
+
+            Divider()
+
+            if scrollable {
+                ScrollView { formContent }
+            } else {
+                formContent
+            }
+
+            Divider()
+
+            HStack {
+                if let errorText {
+                    Text(errorText)
+                        .font(.callout)
+                        .foregroundStyle(.red)
+                        .lineLimit(3)
+                        .textSelection(.enabled)
+                }
+                Spacer()
+                Button("Cancel") { dismiss() }
+                Button {
+                    run()
+                } label: {
+                    if running {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Text("Run")
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(image.isEmpty || running)
+            }
+            .padding(16)
+        }
+        .frame(width: 560, height: 680)
+        .onAppear {
+            image = prefilledImage
+            if network.isEmpty || !state.networks.contains(where: { $0.name == network }) {
+                network = state.networks.first?.name ?? "default"
+            }
+        }
+    }
+
+    private var formContent: some View {
+        VStack(spacing: 14) {
+            DetailCard(title: "Image", icon: "square.stack.3d.down.forward") {
+                HStack(spacing: 8) {
+                    TextField("nginx:latest", text: $image)
+                        .textFieldStyle(.roundedBorder)
+                    if !state.images.isEmpty {
+                        Menu {
+                            ForEach(state.images) { img in
+                                Button(img.shortNameTag) { image = img.name }
+                            }
+                        } label: {
+                            Image(systemName: "chevron.up.chevron.down")
+                        }
+                        .menuStyle(.borderlessButton)
+                        .fixedSize()
+                        .help("Choose a local image")
+                    }
+                }
+                TextField("Container name (optional)", text: $name)
+                    .textFieldStyle(.roundedBorder)
+                TextField("Command override (optional, e.g. sleep infinity)", text: $command)
+                    .textFieldStyle(.roundedBorder)
+            }
+
+            DetailCard(title: "Ports", icon: "arrow.left.arrow.right") {
+                KeyValueEditor(keyPlaceholder: "Host port", valuePlaceholder: "Container port", pairs: $ports)
+            }
+            DetailCard(title: "Environment", icon: "list.bullet.rectangle") {
+                KeyValueEditor(keyPlaceholder: "KEY", valuePlaceholder: "value", pairs: $envVars, separator: "=")
+            }
+            DetailCard(title: "Mounts", icon: "externaldrive") {
+                KeyValueEditor(keyPlaceholder: "Volume name or host path", valuePlaceholder: "Container path", pairs: $volumeMounts)
+            }
+
+            DetailCard(title: "Resources & Network", icon: "cpu") {
+                HStack(alignment: .firstTextBaseline, spacing: 18) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("CPUs").font(.caption).foregroundStyle(.secondary)
+                        TextField("4", text: $cpus)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 60)
+                    }
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Memory").font(.caption).foregroundStyle(.secondary)
+                        TextField("1gb", text: $memory)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 90)
+                    }
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Network").font(.caption).foregroundStyle(.secondary)
+                        Picker("", selection: $network) {
+                            ForEach(state.networks) { net in
+                                Text(net.name).tag(net.name)
+                            }
+                        }
+                        .labelsHidden()
+                        .fixedSize()
+                    }
+                    Spacer()
+                }
+            }
+        }
+        .padding(16)
+    }
+
+    private func run() {
+        running = true
+        errorText = nil
+
+        var processArgs: [String] = []
+        for e in envVars where !e.key.isEmpty {
+            processArgs += ["--env", "\(e.key)=\(e.value)"]
+        }
+
+        var managementArgs: [String] = []
+        for p in ports where !p.key.isEmpty && !p.value.isEmpty {
+            managementArgs += ["--publish", "\(p.key):\(p.value)"]
+        }
+        for m in volumeMounts where !m.key.isEmpty && !m.value.isEmpty {
+            if m.key.hasPrefix("/") || m.key.hasPrefix("~") {
+                let src = (m.key as NSString).expandingTildeInPath
+                managementArgs += ["--mount", "type=bind,source=\(src),target=\(m.value)"]
+            } else {
+                managementArgs += ["--mount", "type=volume,source=\(m.key),target=\(m.value)"]
+            }
+        }
+        if network != "default" && !network.isEmpty { managementArgs += ["--network", network] }
+
+        var resourceArgs: [String] = []
+        if !cpus.isEmpty { resourceArgs += ["--cpus", cpus] }
+        if !memory.isEmpty { resourceArgs += ["--memory", memory] }
+
+        let commandArgs = command.isEmpty ? [] : command.split(separator: " ").map(String.init)
+        let containerName = name
+
+        Task {
+            do {
+                try await ContainerService.runContainer(
+                    image: image,
+                    name: containerName.isEmpty ? nil : containerName,
+                    processArgs: processArgs,
+                    managementArgs: managementArgs,
+                    resourceArgs: resourceArgs,
+                    commandArgs: commandArgs
+                )
+                await state.refreshAll()
+                dismiss()
+            } catch let e as CLIError {
+                errorText = e.message
+            } catch {
+                errorText = error.localizedDescription
+            }
+            running = false
+        }
+    }
+}
+
+// MARK: - Pull image sheet
+
+struct PullImageSheet: View {
+    @EnvironmentObject var state: AppState
+    @Environment(\.dismiss) private var dismiss
+    @StateObject private var model = PullProgressModel()
+    @State private var reference = ""
+    @State private var started = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Pull Image").font(.title3.weight(.semibold))
+                Spacer()
+            }
+            .padding(20)
+            Divider()
+
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    TextField("Image reference (e.g. nginx:latest, ghcr.io/org/app:tag)", text: $reference)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit { pull() }
+                        .disabled(model.isRunning)
+                    Button {
+                        pull()
+                    } label: {
+                        if model.isRunning {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Text("Pull")
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(reference.isEmpty || model.isRunning)
+                }
+                Text("Popular: alpine, ubuntu, nginx, redis, postgres, node, python")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+
+                if started {
+                    ConsoleView(lines: model.lines)
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(.separator))
+                }
+            }
+            .padding(16)
+
+            Divider()
+            HStack {
+                if let ok = model.succeeded {
+                    Label(ok ? "Pull complete" : "Pull failed",
+                          systemImage: ok ? "checkmark.circle.fill" : "xmark.circle.fill")
+                        .foregroundStyle(ok ? .green : .red)
+                        .font(.callout)
+                }
+                Spacer()
+                Button(model.succeeded == true ? "Done" : "Close") {
+                    model.cancel()
+                    dismiss()
+                }
+            }
+            .padding(16)
+        }
+        .frame(width: 560, height: started ? 480 : 220)
+        .onChange(of: model.succeeded) {
+            if model.succeeded == true {
+                Task { await state.refreshAll() }
+            }
+        }
+        .onDisappear { model.cancel() }
+    }
+
+    private func pull() {
+        guard !reference.isEmpty else { return }
+        started = true
+        model.start(reference: reference)
+    }
+}
+
+// MARK: - Create volume sheet
+
+struct CreateVolumeSheet: View {
+    @EnvironmentObject var state: AppState
+    @Environment(\.dismiss) private var dismiss
+    @State private var name = ""
+    @State private var size = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Create Volume").font(.title3.weight(.semibold))
+            TextField("Volume name", text: $name)
+                .textFieldStyle(.roundedBorder)
+            TextField("Max size (optional, e.g. 10G — default 512G)", text: $size)
+                .textFieldStyle(.roundedBorder)
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                Button("Create") {
+                    let n = name, s = size
+                    state.perform("volume-create") { try await ContainerService.createVolume(name: n, size: s.isEmpty ? nil : s) }
+                    dismiss()
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(name.isEmpty)
+            }
+        }
+        .padding(20)
+        .frame(width: 420)
+    }
+}
+
+// MARK: - Create network sheet
+
+struct CreateNetworkSheet: View {
+    @EnvironmentObject var state: AppState
+    @Environment(\.dismiss) private var dismiss
+    @State private var name = ""
+    @State private var subnet = ""
+    @State private var isInternal = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Create Network").font(.title3.weight(.semibold))
+            TextField("Network name", text: $name)
+                .textFieldStyle(.roundedBorder)
+            TextField("Subnet (optional, e.g. 192.168.100.0/24)", text: $subnet)
+                .textFieldStyle(.roundedBorder)
+            Toggle("Internal (host-only, no outbound access)", isOn: $isInternal)
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                Button("Create") {
+                    let n = name, s = subnet, i = isInternal
+                    state.perform("network-create") {
+                        try await ContainerService.createNetwork(name: n, subnet: s.isEmpty ? nil : s, internal: i)
+                    }
+                    dismiss()
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(name.isEmpty)
+            }
+        }
+        .padding(20)
+        .frame(width: 420)
+    }
+}
