@@ -4,7 +4,9 @@ struct ContainerStackApp: App {
     @StateObject private var state = AppState()
 
     var body: some Scene {
-        WindowGroup {
+        // A single reopenable window (WindowGroup windows die on close and the
+        // menu bar extra could no longer reopen them).
+        Window("Davit", id: "main") {
             MainWindow()
                 .environmentObject(state)
                 .frame(minWidth: 940, minHeight: 560)
@@ -71,10 +73,8 @@ struct MenuBarContent: View {
             Divider()
 
             Button("Open Davit") {
+                openWindow(id: "main")
                 NSApp.activate(ignoringOtherApps: true)
-                for window in NSApp.windows where window.canBecomeMain {
-                    window.makeKeyAndOrderFront(nil)
-                }
             }
             Button("Quit Davit") { NSApp.terminate(nil) }
         }
