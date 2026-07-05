@@ -92,7 +92,7 @@ struct MenuBarIcon: View {
         Image(systemName: "shippingbox.fill")
             .task {
                 let args = ProcessInfo.processInfo.arguments
-                guard args.contains(where: { $0.hasPrefix("--snapshot") || $0.hasPrefix("--probe") }) else { return }
+                guard args.contains(where: { $0.hasPrefix("--snapshot") || $0.hasPrefix("--probe") || $0.hasPrefix("--pose") }) else { return }
                 try? await Task.sleep(for: .seconds(2))
                 if !NSApp.windows.contains(where: { $0.isVisible && $0.canBecomeMain }) {
                     FileHandle.standardError.write(Data("harness: window missing after launch, forcing open\n".utf8))

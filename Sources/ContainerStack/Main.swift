@@ -17,7 +17,7 @@ enum Main {
     static func main() {
         ContainerBinary.bootstrapEnvironment()
         let args = CommandLine.arguments
-        if args.contains(where: { $0.hasPrefix("--snapshot") || $0.hasPrefix("--probe") }) {
+        if args.contains(where: { $0.hasPrefix("--snapshot") || $0.hasPrefix("--probe") || $0.hasPrefix("--pose") }) {
             activityToken = ProcessInfo.processInfo.beginActivity(
                 options: [.userInitiated, .idleSystemSleepDisabled],
                 reason: "headless UI harness")

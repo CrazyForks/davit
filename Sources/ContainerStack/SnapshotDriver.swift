@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 
+
 /// Headless UI verification: `Davit.app/Contents/MacOS/Davit --snapshot /tmp/out`
 /// waits for live data, renders each major screen via ImageRenderer (no
 /// screen-recording permission needed), writes PNGs, then quits.
@@ -9,6 +10,35 @@ enum SnapshotDriver {
         let args = ProcessInfo.processInfo.arguments
         guard let i = args.firstIndex(of: "--snapshot"), i + 1 < args.count else { return nil }
         return args[i + 1]
+    }
+
+    /// `--pose`: cycles the real window through each section, pausing so an
+    /// external tool can screenshot it. Announces "POSED <section>" on stderr.
+    @MainActor
+    static func runPoseIfRequested(selection: Binding<SidebarSection?>) {
+        let args = ProcessInfo.processInfo.arguments
+        if args.contains("--pose-detail") {
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(8))
+                selection.wrappedValue = .containers
+                try? await Task.sleep(for: .seconds(6))
+                FileHandle.standardError.write(Data("POSED detail\n".utf8))
+                try? await Task.sleep(for: .seconds(2))
+                FileHandle.standardError.write(Data("POSED done\n".utf8))
+            }
+            return
+        }
+        guard args.contains("--pose") else { return }
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(8))
+            for section in SidebarSection.allCases {
+                selection.wrappedValue = section
+                try? await Task.sleep(for: .seconds(3))
+                FileHandle.standardError.write(Data("POSED \(section.rawValue)\n".utf8))
+                try? await Task.sleep(for: .seconds(3))
+            }
+            FileHandle.standardError.write(Data("POSED done\n".utf8))
+        }
     }
 
     @MainActor

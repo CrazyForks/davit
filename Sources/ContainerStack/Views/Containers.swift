@@ -65,7 +65,8 @@ struct ContainersView: View {
             }
         }
         .task {
-            if ProcessInfo.processInfo.arguments.contains("--probe-recreate-detail") {
+            if ProcessInfo.processInfo.arguments.contains("--probe-recreate-detail")
+                || ProcessInfo.processInfo.arguments.contains("--pose-detail") {
                 for _ in 0..<20 {
                     if let first = state.containers.first {
                         path.append(first.id)

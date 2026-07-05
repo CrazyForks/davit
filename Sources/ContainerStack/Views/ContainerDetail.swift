@@ -12,7 +12,7 @@ struct ContainerDetailView: View {
         case stats = "Stats"
         case inspect = "Inspect"
     }
-    @State private var tab: Tab = .overview
+    @State private var tab: Tab = ProcessInfo.processInfo.arguments.contains("--pose-tab-stats") ? .stats : .overview
 
     private var container: ContainerRecord? {
         state.containers.first { $0.id == containerID }

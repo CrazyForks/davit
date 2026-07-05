@@ -41,6 +41,7 @@ struct MainWindow: View {
         }
         .task {
             SnapshotDriver.runIfRequested(state: state)
+            SnapshotDriver.runPoseIfRequested(selection: $selection)
             if ProcessInfo.processInfo.arguments.contains(where: { $0.hasPrefix("--probe-recreate") }) {
                 Task { @MainActor in
                     try? await Task.sleep(for: .seconds(6))
