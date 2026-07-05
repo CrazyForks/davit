@@ -14,8 +14,8 @@ BUCKET="${1:?usage: site/deploy.sh <bucket-name>}"
 cd "$(dirname "$0")"
 
 gsutil -m rsync -r -d -x 'deploy\.sh$' . "gs://${BUCKET}"
-# Sensible cache headers: short for HTML, long for images.
-gsutil -m setmeta -h "Cache-Control:public, max-age=300" "gs://${BUCKET}/index.html"
+# Cache headers: HTML revalidates every visit (instant deploys), images cache a day.
+gsutil -m setmeta -h "Cache-Control:no-cache" "gs://${BUCKET}/index.html"
 gsutil -m setmeta -h "Cache-Control:public, max-age=86400" "gs://${BUCKET}/img/*" 2>/dev/null || true
 
 echo "Deployed: https://storage.googleapis.com/${BUCKET}/index.html"
