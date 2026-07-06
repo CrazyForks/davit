@@ -171,9 +171,23 @@ struct DashboardView: View {
             if series.isEmpty {
                 Text("Collecting stats…").font(.callout).foregroundStyle(.secondary)
             } else {
+                let ids = series.map(\.id)
+                let colors = ids.indices.map { Self.seriesPalette[$0 % Self.seriesPalette.count] }
                 Chart {
-                    ForEach(series, id: \.id) { entry in
+                    ForEach(Array(series.enumerated()), id: \.element.id) { idx, entry in
+                        let color = Self.seriesPalette[idx % Self.seriesPalette.count]
                         ForEach(entry.samples) { s in
+                            // Gradient fill under each container's line, matching the
+                            // per-container Stats charts' look.
+                            AreaMark(
+                                x: .value("Time", s.time),
+                                y: .value(aggMetric.rawValue, aggMetric.value(s)),
+                                series: .value("Container", entry.id)
+                            )
+                            .interpolationMethod(.monotone)
+                            .foregroundStyle(.linearGradient(
+                                colors: [color.opacity(0.28), color.opacity(0.02)],
+                                startPoint: .top, endPoint: .bottom))
                             LineMark(
                                 x: .value("Time", s.time),
                                 y: .value(aggMetric.rawValue, aggMetric.value(s)),
@@ -181,14 +195,20 @@ struct DashboardView: View {
                             )
                             .foregroundStyle(by: .value("Container", entry.id))
                             .interpolationMethod(.monotone)
+                            .lineStyle(StrokeStyle(lineWidth: 2))
                         }
                     }
                 }
+                .chartForegroundStyleScale(domain: ids, range: colors)
                 .chartYAxisLabel(aggMetric.axisLabel)
                 .frame(height: 180)
             }
         }
     }
+
+    /// Distinct per-container series colors; index 0 (blue) matches the CPU accent
+    /// so a single-container chart reads like the per-container Stats chart.
+    static let seriesPalette: [Color] = [.blue, .purple, .green, .orange, .pink, .teal, .indigo, .red]
 }
 
 /// Split out of DashboardView.diskCard: the combined expression exceeded the
