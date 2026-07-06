@@ -39,7 +39,24 @@ struct MainWindow: View {
                 }
             }
         }
+        .onChange(of: state.pendingContainerOpen) {
+            // A container was clicked from another section (e.g. Dashboard) —
+            // switch to Containers, which consumes the intent and pushes detail.
+            if state.pendingContainerOpen != nil { selection = .containers }
+        }
         .task {
+            if ProcessInfo.processInfo.arguments.contains("--probe-dashboard-open") {
+                Task { @MainActor in
+                    try? await Task.sleep(for: .seconds(8))
+                    selection = .dashboard
+                    try? await Task.sleep(for: .seconds(1))
+                    let target = state.runningContainers.first?.id ?? "none"
+                    FileHandle.standardError.write(Data("DBG dashboard-click \(target)\n".utf8))
+                    state.pendingContainerOpen = target
+                    try? await Task.sleep(for: .seconds(3))
+                    FileHandle.standardError.write(Data("DBG after-click selection=\(selection.map { $0.rawValue } ?? "nil")\n".utf8))
+                }
+            }
             SnapshotDriver.runIfRequested(state: state)
             SnapshotDriver.runPoseIfRequested(selection: $selection)
             if ProcessInfo.processInfo.arguments.contains(where: { $0.hasPrefix("--probe-recreate") }) {

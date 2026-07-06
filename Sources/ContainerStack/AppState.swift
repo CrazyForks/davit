@@ -21,6 +21,9 @@ final class AppState: ObservableObject {
     // UI state
     @Published var busyIDs: Set<String> = []
     @Published var recreateTarget: ContainerRecord?
+    /// Cross-view intent: a container to reveal in the Containers detail view
+    /// (e.g. clicked from the Dashboard). Consumed by ContainersView.
+    @Published var pendingContainerOpen: String?
     @Published var lastError: CLIError?
     @Published var isRefreshing = false
     @Published var initialLoadDone = false

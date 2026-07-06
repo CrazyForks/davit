@@ -63,6 +63,8 @@ struct ContainersView: View {
             .sheet(isPresented: $showRunSheet) {
                 RunContainerSheet()
             }
+            .onChange(of: state.pendingContainerOpen) { consumePendingOpen() }
+            .onAppear { consumePendingOpen() }
         }
         .task {
             if ProcessInfo.processInfo.arguments.contains("--probe-recreate-detail")
@@ -82,6 +84,13 @@ struct ContainersView: View {
     private var list: some View {
         ContainerListContent(containers: filtered) { path.append($0) }
             .refreshIndicator(state.isRefreshing)
+    }
+
+    /// Reveal a container requested from another section (e.g. the Dashboard).
+    private func consumePendingOpen() {
+        guard let id = state.pendingContainerOpen else { return }
+        state.pendingContainerOpen = nil
+        if path.last != id { path.append(id) }
     }
 }
 

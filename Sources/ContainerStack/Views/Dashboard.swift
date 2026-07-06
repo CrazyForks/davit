@@ -117,38 +117,9 @@ struct DashboardView: View {
 
     private var runningCard: some View {
         DetailCard(title: "Running Containers", icon: "play.circle") {
-            VStack(spacing: 4) {
+            VStack(spacing: 2) {
                 ForEach(state.runningContainers) { c in
-                    HStack(spacing: 10) {
-                        StatusDot(color: .green, pulsing: true)
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(c.id).font(.callout.weight(.medium))
-                            Text(c.shortImage).font(.caption).foregroundStyle(.secondary)
-                        }
-                        Spacer()
-                        if let s = state.latestSample(for: c.id) {
-                            Text(String(format: "%.0f%% CPU · %@", s.cpuPercent, formatBytes(s.memoryBytes)))
-                                .font(.system(.caption, design: .monospaced))
-                                .foregroundStyle(.secondary)
-                        }
-                        Button {
-                            TerminalLauncher.openShell(containerID: c.id)
-                        } label: {
-                            Image(systemName: "terminal")
-                        }
-                        .buttonStyle(.plain)
-                        .foregroundStyle(.secondary)
-                        .help("Open Terminal")
-                        Button {
-                            state.stopContainer(c)
-                        } label: {
-                            Image(systemName: "stop.fill")
-                        }
-                        .buttonStyle(.plain)
-                        .foregroundStyle(.secondary)
-                        .help("Stop")
-                    }
-                    .padding(.vertical, 4)
+                    DashboardContainerRow(container: c)
                 }
             }
         }
@@ -281,6 +252,60 @@ struct UpdateBanner: View {
         .padding(16)
         .background(.tint.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
         .overlay(RoundedRectangle(cornerRadius: 12).stroke(.tint.opacity(0.25)))
+    }
+}
+
+/// A running-container row on the Dashboard. Clicking the row reveals the
+/// container's detail (via AppState.pendingContainerOpen); the trailing
+/// terminal/stop buttons keep their own actions.
+struct DashboardContainerRow: View {
+    @EnvironmentObject var state: AppState
+    let container: ContainerRecord
+    @State private var hovering = false
+
+    var body: some View {
+        HStack(spacing: 10) {
+            StatusDot(color: .green, pulsing: true)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(container.id).font(.callout.weight(.medium))
+                Text(container.shortImage).font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+            if let s = state.latestSample(for: container.id) {
+                Text(String(format: "%.0f%% CPU · %@", s.cpuPercent, formatBytes(s.memoryBytes)))
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+            Button {
+                TerminalLauncher.openShell(containerID: container.id)
+            } label: {
+                Image(systemName: "terminal")
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .help("Open Terminal")
+            Button {
+                state.stopContainer(container)
+            } label: {
+                Image(systemName: "stop.fill")
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .help("Stop")
+            Image(systemName: "chevron.right")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.tertiary)
+        }
+        .padding(.vertical, 5)
+        .padding(.horizontal, 8)
+        .contentShape(Rectangle())
+        .background(
+            hovering ? AnyShapeStyle(.primary.opacity(0.055)) : AnyShapeStyle(.clear),
+            in: RoundedRectangle(cornerRadius: 8)
+        )
+        .onHover { hovering = $0 }
+        .onTapGesture { state.pendingContainerOpen = container.id }
+        .help("Open \(container.id)")
     }
 }
 

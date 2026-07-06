@@ -32,6 +32,11 @@ struct ContainerDetailView: View {
             }
         }
         .navigationTitle(containerID)
+        .onAppear {
+            if ProcessInfo.processInfo.arguments.contains(where: { $0.hasPrefix("--probe") }) {
+                FileHandle.standardError.write(Data("DBG detail-view-shown \(containerID)\n".utf8))
+            }
+        }
         .toolbar {
             if let container {
                 ToolbarItemGroup(placement: .primaryAction) {
@@ -423,3 +428,4 @@ struct InspectTab: View {
         }
     }
 }
+
