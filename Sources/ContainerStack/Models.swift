@@ -329,7 +329,17 @@ struct StatsSample: Identifiable, Hashable {
     let memoryLimit: Int64
     let rxBytes: Int64
     let txBytes: Int64
+    /// Disk I/O throughput in bytes/second, derived from block-I/O deltas.
+    let diskReadRate: Double
+    let diskWriteRate: Double
+    /// Disk space consumed by the container (writable layer). Refreshed on a
+    /// slower cadence than the 2s stats poll and carried forward between refreshes.
+    let diskUsageBytes: Int64
     let processes: Int
+
+    var memoryPercent: Double {
+        memoryLimit > 0 ? Double(memoryBytes) / Double(memoryLimit) * 100 : 0
+    }
 }
 
 // MARK: - System

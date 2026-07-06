@@ -326,12 +326,15 @@ struct ContainerStatsTab: View {
                         StatTile(title: "Memory",
                                  value: formatBytes(latest?.memoryBytes),
                                  subtitle: "limit \(formatBytes(latest?.memoryLimit))")
-                        StatTile(title: "Processes",
-                                 value: "\(latest?.processes ?? 0)",
-                                 subtitle: "running")
+                        StatTile(title: "Disk",
+                                 value: formatBytes(latest?.diskUsageBytes),
+                                 subtitle: "↓\(rate(latest?.diskReadRate)) ↑\(rate(latest?.diskWriteRate))")
                         StatTile(title: "Network",
                                  value: "↓ \(formatBytes(latest?.rxBytes))",
                                  subtitle: "↑ \(formatBytes(latest?.txBytes))")
+                        StatTile(title: "Processes",
+                                 value: "\(latest?.processes ?? 0)",
+                                 subtitle: "running")
                     }
 
                     DetailCard(title: "CPU Usage", icon: "cpu") {
@@ -365,8 +368,33 @@ struct ContainerStatsTab: View {
                         .chartYAxisLabel("MB")
                         .frame(height: 160)
                     }
+
+                    DetailCard(title: "Disk I/O", icon: "internaldrive") {
+                        Chart {
+                            ForEach(history) { sample in
+                                LineMark(x: .value("Time", sample.time),
+                                         y: .value("KB/s", sample.diskReadRate / 1024),
+                                         series: .value("dir", "Read"))
+                                    .foregroundStyle(.orange)
+                                    .interpolationMethod(.monotone)
+                                LineMark(x: .value("Time", sample.time),
+                                         y: .value("KB/s", sample.diskWriteRate / 1024),
+                                         series: .value("dir", "Write"))
+                                    .foregroundStyle(.teal)
+                                    .interpolationMethod(.monotone)
+                            }
+                        }
+                        .chartForegroundStyleScale(["Read": Color.orange, "Write": Color.teal])
+                        .chartYAxisLabel("KB/s")
+                        .frame(height: 160)
+                    }
                 }
                 .padding(16)
+    }
+
+    /// Compact per-second rate label, e.g. "1.2 MB/s".
+    private func rate(_ bytesPerSec: Double?) -> String {
+        formatBytes(Int64(bytesPerSec ?? 0)) + "/s"
     }
 }
 

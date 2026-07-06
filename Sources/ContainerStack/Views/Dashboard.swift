@@ -1,9 +1,32 @@
 import SwiftUI
 import Charts
 
+enum AggregateMetric: String, CaseIterable, Identifiable {
+    case cpu = "CPU"
+    case memory = "Memory"
+    case diskIO = "Disk I/O"
+    var id: String { rawValue }
+
+    var axisLabel: String {
+        switch self {
+        case .cpu: return "%"
+        case .memory: return "MB"
+        case .diskIO: return "KB/s"
+        }
+    }
+    func value(_ s: StatsSample) -> Double {
+        switch self {
+        case .cpu: return s.cpuPercent
+        case .memory: return Double(s.memoryBytes) / 1_048_576
+        case .diskIO: return (s.diskReadRate + s.diskWriteRate) / 1024
+        }
+    }
+}
+
 struct DashboardView: View {
     @EnvironmentObject var state: AppState
     var scrollable = true
+    @State private var aggMetric: AggregateMetric = .cpu
 
     var body: some View {
         Group {
@@ -128,7 +151,15 @@ struct DashboardView: View {
     // MARK: Aggregate CPU chart
 
     private var aggregateChart: some View {
-        DetailCard(title: "CPU — All Running Containers", icon: "chart.xyaxis.line") {
+        DetailCard(title: "All Running Containers", icon: "chart.xyaxis.line") {
+            Picker("", selection: $aggMetric) {
+                ForEach(AggregateMetric.allCases) { Text($0.rawValue).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(maxWidth: 320)
+            .padding(.bottom, 4)
+
             let series: [(id: String, samples: [StatsSample])] = state.runningContainers.compactMap { c in
                 guard let h = state.statsHistory[c.id], h.count > 1 else { return nil }
                 return (c.id, h)
@@ -141,7 +172,7 @@ struct DashboardView: View {
                         ForEach(entry.samples) { s in
                             LineMark(
                                 x: .value("Time", s.time),
-                                y: .value("CPU %", s.cpuPercent),
+                                y: .value(aggMetric.rawValue, aggMetric.value(s)),
                                 series: .value("Container", entry.id)
                             )
                             .foregroundStyle(by: .value("Container", entry.id))
@@ -149,7 +180,7 @@ struct DashboardView: View {
                         }
                     }
                 }
-                .chartYAxisLabel("%")
+                .chartYAxisLabel(aggMetric.axisLabel)
                 .frame(height: 180)
             }
         }
@@ -272,7 +303,7 @@ struct DashboardContainerRow: View {
             }
             Spacer()
             if let s = state.latestSample(for: container.id) {
-                Text(String(format: "%.0f%% CPU · %@", s.cpuPercent, formatBytes(s.memoryBytes)))
+                Text("\(String(format: "%.0f%%", s.cpuPercent)) CPU · \(formatBytes(s.memoryBytes)) · \(formatBytes(s.diskUsageBytes)) disk")
                     .font(.system(.caption, design: .monospaced))
                     .foregroundStyle(.secondary)
             }

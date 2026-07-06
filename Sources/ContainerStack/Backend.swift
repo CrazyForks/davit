@@ -156,6 +156,24 @@ enum ContainerService {
         }
     }
 
+    /// Per-container disk space used (writable layer), in bytes, keyed by id.
+    static func containerDiskUsage(for ids: [String]) async -> [String: Int64] {
+        let client = ContainerClient()
+        return await withTaskGroup(of: (String, Int64)?.self) { group in
+            for id in ids {
+                group.addTask {
+                    guard let bytes = try? await client.diskUsage(id: id) else { return nil }
+                    return (id, Int64(bytes))
+                }
+            }
+            var out: [String: Int64] = [:]
+            for await entry in group {
+                if let (id, bytes) = entry { out[id] = bytes }
+            }
+            return out
+        }
+    }
+
     static func diskUsage() async throws -> DiskUsage {
         let df = try await ClientDiskUsage.get()
         func map(_ u: ResourceUsage) -> DiskUsage.Section {

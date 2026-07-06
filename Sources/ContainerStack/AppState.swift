@@ -16,7 +16,10 @@ final class AppState: ObservableObject {
 
     // Live stats: history per container id
     @Published var statsHistory: [String: [StatsSample]] = [:]
-    private var lastRawStats: [String: (cpuUsec: Int64, rx: Int64, tx: Int64, at: Date)] = [:]
+    private var lastRawStats: [String: (cpuUsec: Int64, blockRead: Int64, blockWrite: Int64, at: Date)] = [:]
+    // Per-container disk space, refreshed on a slower cadence than the 2s poll.
+    private var diskUsageCache: [String: Int64] = [:]
+    private var diskUsageTick = 0
 
     // UI state
     @Published var busyIDs: Set<String> = []
@@ -118,28 +121,44 @@ final class AppState: ObservableObject {
 
     func refreshStats() async {
         guard systemState.isRunning, !runningContainers.isEmpty else { return }
-        guard let raw = try? await ContainerService.stats(for: runningContainers.map(\.id)) else { return }
+        let ids = runningContainers.map(\.id)
+        guard let raw = try? await ContainerService.stats(for: ids) else { return }
         let now = Date()
+
+        // Disk space changes slowly and is costlier to compute, so refresh it
+        // every ~10s (every 5th 2s tick) and carry the value forward otherwise.
+        diskUsageTick += 1
+        if diskUsageTick % 5 == 1 {
+            let usage = await ContainerService.containerDiskUsage(for: ids)
+            for (id, bytes) in usage { diskUsageCache[id] = bytes }
+        }
+
         for record in raw {
             let cpuUsec = record.cpuUsageUsec ?? 0
-            let rx = record.networkRxBytes ?? 0
-            let tx = record.networkTxBytes ?? 0
+            let blockRead = record.blockReadBytes ?? 0
+            let blockWrite = record.blockWriteBytes ?? 0
             var cpuPercent = 0.0
+            var diskReadRate = 0.0
+            var diskWriteRate = 0.0
             if let prev = lastRawStats[record.id] {
                 let dt = now.timeIntervalSince(prev.at)
                 if dt > 0.1 {
-                    let deltaUsec = Double(max(0, cpuUsec - prev.cpuUsec))
-                    cpuPercent = deltaUsec / (dt * 1_000_000) * 100.0
+                    cpuPercent = Double(max(0, cpuUsec - prev.cpuUsec)) / (dt * 1_000_000) * 100.0
+                    diskReadRate = Double(max(0, blockRead - prev.blockRead)) / dt
+                    diskWriteRate = Double(max(0, blockWrite - prev.blockWrite)) / dt
                 }
             }
-            lastRawStats[record.id] = (cpuUsec, rx, tx, now)
+            lastRawStats[record.id] = (cpuUsec, blockRead, blockWrite, now)
             let sample = StatsSample(
                 time: now,
                 cpuPercent: cpuPercent,
                 memoryBytes: record.memoryUsageBytes ?? 0,
                 memoryLimit: record.memoryLimitBytes ?? 0,
-                rxBytes: rx,
-                txBytes: tx,
+                rxBytes: record.networkRxBytes ?? 0,
+                txBytes: record.networkTxBytes ?? 0,
+                diskReadRate: diskReadRate,
+                diskWriteRate: diskWriteRate,
+                diskUsageBytes: diskUsageCache[record.id] ?? 0,
                 processes: record.numProcesses ?? 0
             )
             var history = statsHistory[record.id, default: []]
@@ -152,6 +171,7 @@ final class AppState: ObservableObject {
         for key in statsHistory.keys where !live.contains(key) {
             statsHistory[key] = nil
             lastRawStats[key] = nil
+            diskUsageCache[key] = nil
         }
     }
 

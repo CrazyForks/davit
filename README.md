@@ -16,7 +16,7 @@ in-terminal shell (`davit exec`), and even launchd service bootstrap all go thro
 - **Containers** — list with live CPU/memory/IP per row, start/stop/kill/restart/delete, prune, search, and **Edit & Recreate** (containers are immutable on this platform, so "editing" opens the Run sheet prefilled with the container's ports/env/mounts/resources/network — with the image's entrypoint/CMD/env subtracted so only *your* customizations show — and replaces it on confirm). Detail view with:
   - *Overview*: image, command, platform, resources, network (IP/MAC/gateway/hostname), published ports with "Open in Browser", mounts, environment, labels.
   - *Logs*: streaming `-f` follow mode, boot-log toggle, tail selector, copy.
-  - *Stats*: live CPU% and memory charts (Swift Charts), process count, network I/O.
+  - *Stats*: live CPU %, memory, and disk-I/O charts (Swift Charts); tiles for CPU, memory, disk space used, network, and process count.
   - *Inspect*: pretty-printed raw JSON.
   - *Terminal*: opens an interactive shell in Terminal/iTerm (`davit exec` over XPC).
 - **Images** — pull with streaming progress, run-from-image, tag, delete, prune; per-image platform variants, size, digest, "used by" containers.
