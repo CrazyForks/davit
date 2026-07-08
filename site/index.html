@@ -3,11 +3,11 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Davit — a native macOS UI for Apple containers</title>
-<meta name="description" content="Davit is a free, open-source, fully native macOS app for Apple's container platform — containers, images, volumes and networks with live stats, logs, file browsing, private registries, Compose import, Dockerfile builds and one-click setup.">
+<title>Davit - a native macOS UI for Apple containers</title>
+<meta name="description" content="Davit is a free, open-source, fully native macOS app for Apple's container platform: containers, images, volumes and networks with live stats, logs, file browsing, private registries, Compose import, Dockerfile builds and one-click setup.">
 <link rel="icon" type="image/png" sizes="32x32" href="img/favicon-32.png">
-<meta property="og:title" content="Davit — a native macOS UI for Apple containers">
-<meta property="og:description" content="Free, open-source, fully native. Run Linux containers on Apple silicon with Apple's container platform — no Docker Desktop required.">
+<meta property="og:title" content="Davit - a native macOS UI for Apple containers">
+<meta property="og:description" content="Free, open-source, fully native. Run Linux containers on Apple silicon with Apple's container platform; no Docker Desktop required.">
 <meta property="og:image" content="img/dashboard.png">
 <style>
   :root {
@@ -132,7 +132,7 @@
 <header class="hero wrap">
   <img class="icon" src="img/icon-256.png" alt="Davit app icon" width="128" height="128">
   <h1>Davit</h1>
-  <p class="tag">A fully native macOS app for Apple's container platform — run Linux containers on Apple silicon, no Docker Desktop required.</p>
+  <p class="tag">A fully native macOS app for Apple's container platform. Run Linux containers on Apple silicon; no Docker Desktop required.</p>
   <p class="sub">Free &amp; open source · MIT licensed · Signed &amp; notarized</p>
   <div class="cta">
     <a class="btn primary" href="https://github.com/wouterdebie/davit/releases/latest">Download for macOS</a>
@@ -149,28 +149,28 @@
 
 <section class="wrap">
   <h2>What it does</h2>
-  <p class="lead">Davit talks directly to Apple's open-source <a href="https://github.com/apple/container" style="color:var(--accent);text-decoration:none">container</a> daemon over XPC — the same wire path the CLI uses. No Electron, no web views, no background agents of its own.</p>
+  <p class="lead">Davit talks directly to Apple's open-source <a href="https://github.com/apple/container" style="color:var(--accent);text-decoration:none">container</a> daemon over XPC; the same wire path the CLI uses. No Electron, no web views, no background agents of its own.</p>
   <div class="grid">
     <div class="card"><div class="emoji">📦</div><h3>Containers</h3>
       <p>Start, stop, restart and delete with live CPU, memory and IP on every row. Streaming logs with follow &amp; boot mode, live stat charts, and raw config inspection.</p></div>
     <div class="card"><div class="emoji">🖥️</div><h3>One-click terminal</h3>
-      <p>Open an interactive shell in any running container, straight into Terminal or iTerm — over the native API, no CLI needed.</p></div>
+      <p>Open an interactive shell in any running container, straight into Terminal or iTerm; over the native API, no CLI needed.</p></div>
     <div class="card"><div class="emoji">🪄</div><h3>Edit &amp; Recreate</h3>
-      <p>Containers are immutable — so Davit prefills a new one from the old config with the image's entrypoint and env subtracted, letting you change ports, env vars, mounts or resources in seconds.</p></div>
+      <p>Containers are immutable, so Davit prefills a new one from the old config with the image's entrypoint and env subtracted, letting you change ports, env vars, mounts or resources in seconds.</p></div>
     <div class="card"><div class="emoji">📂</div><h3>In-container files</h3>
-      <p>Browse any running container's filesystem right in the app — navigate folders, download files to your Mac, upload or delete — over the native API, no <code>docker cp</code> incantations.</p></div>
+      <p>Browse any running container's filesystem right in the app: navigate folders, download files to your Mac, upload or delete. All over the native API, no <code>docker cp</code> incantations.</p></div>
     <div class="card"><div class="emoji">🐳</div><h3>Compose import</h3>
-      <p>Open a <code>docker-compose.yml</code> and Davit shows exactly what it will create — services in dependency order, volumes, networks, the equivalent CLI command per service, and honest warnings for anything unsupported — then starts the whole stack in one click.</p></div>
+      <p>Open a <code>docker-compose.yml</code> and Davit shows exactly what it will create: services in dependency order, volumes, networks, the equivalent CLI command per service, and honest warnings for anything unsupported. Then it starts the whole stack in one click.</p></div>
     <div class="card"><div class="emoji">🔨</div><h3>Build from a Dockerfile</h3>
-      <p>Pick a context folder, set a tag, hit Build. Davit drives Apple's BuildKit builder directly — starting it if needed — and the image lands in your library, ready to run.</p></div>
+      <p>Pick a context folder, set a tag, hit Build. Davit drives Apple's BuildKit builder directly, starting it if needed, and the image lands in your library, ready to run.</p></div>
     <div class="card"><div class="emoji">💿</div><h3>Images, volumes, networks</h3>
       <p>Pull with live progress, run from any image, tag, prune. Create sized volumes and custom subnets. See what's in use before you delete it.</p></div>
     <div class="card"><div class="emoji">🔑</div><h3>Registry logins</h3>
-      <p>Sign in to Docker Hub, ghcr.io, quay.io or any registry to pull private images. Credentials are verified on the spot and stored in your login keychain — shared with the <code>container</code> CLI, so both see them.</p></div>
+      <p>Sign in to Docker Hub, ghcr.io, quay.io or any registry to pull private images. Credentials are verified on the spot and stored in your login keychain, shared with the <code>container</code> CLI, so both see them.</p></div>
     <div class="card"><div class="emoji">⚙️</div><h3>Platform settings, editable</h3>
-      <p>Default CPU/memory for new containers, registry, DNS, builder resources — edited in the app, validated by the platform's own config loader, saved as clean TOML overrides.</p></div>
+      <p>Default CPU/memory for new containers, registry, DNS, builder resources; edited in the app, validated by the platform's own config loader, saved as clean TOML overrides.</p></div>
     <div class="card"><div class="emoji">⬇️</div><h3>Installs the platform for you</h3>
-      <p>No container platform installed? Davit downloads Apple's signed installer, verifies it, and sets everything up in your user Library — <em>no administrator rights needed</em>. It can add the <code>container</code> CLI to your shell, too.</p></div>
+      <p>No container platform installed? Davit downloads Apple's signed installer, verifies it, and sets everything up in your user Library; <em>no administrator rights needed</em>. It can add the <code>container</code> CLI to your shell, too.</p></div>
   </div>
 </section>
 
@@ -182,9 +182,9 @@
     <figure><img src="img/container-stats.png" alt="Live CPU and memory charts for a container"><figcaption>Per-container CPU &amp; memory, sampled every 2 seconds.</figcaption></figure>
     <figure><img src="img/container-overview.png" alt="Container detail overview with network, ports, mounts and environment"><figcaption>Network, ports, mounts and environment at a glance.</figcaption></figure>
     <figure><img src="img/images.png" alt="Image list with platform variants, sizes and in-use badges"><figcaption>Images with sizes, platforms and in-use badges.</figcaption></figure>
-    <figure><img src="img/files.png" alt="Browsing a running container's filesystem with folders, file sizes and per-file download"><figcaption>Browse a container's files — navigate, download, upload, delete.</figcaption></figure>
+    <figure><img src="img/files.png" alt="Browsing a running container's filesystem with folders, file sizes and per-file download"><figcaption>Browse a container's files; navigate, download, upload, delete.</figcaption></figure>
     <figure><img src="img/registries.png" alt="Registry logins in Settings, listing signed-in registries"><figcaption>Sign in to registries to pull private images.</figcaption></figure>
-    <figure><img src="img/compose.png" alt="Compose import preview showing services, volumes, networks and warnings before starting the stack"><figcaption>Import a compose file — preview the plan, start the stack.</figcaption></figure>
+    <figure><img src="img/compose.png" alt="Compose import preview showing services, volumes, networks and warnings before starting the stack"><figcaption>Import a compose file; preview the plan, start the stack.</figcaption></figure>
   </div>
 </section>
 
@@ -194,7 +194,7 @@
   <ol class="steps">
     <li><span class="num"></span>
       <h3>Install &amp; open Davit</h3>
-      <p>Grab it from <a href="https://github.com/wouterdebie/davit/releases/latest" style="color:var(--accent);text-decoration:none">Releases</a> or <code style="background:rgba(125,125,140,.12);padding:1px 6px;border-radius:5px">brew install wouterdebie/tap/davit</code>. On first launch, if Apple's container platform isn't installed, Davit sets it up for you — no admin password needed.</p>
+      <p>Grab it from <a href="https://github.com/wouterdebie/davit/releases/latest" style="color:var(--accent);text-decoration:none">Releases</a> or <code style="background:rgba(125,125,140,.12);padding:1px 6px;border-radius:5px">brew install wouterdebie/tap/davit</code>. On first launch, if Apple's container platform isn't installed, Davit sets it up for you; no admin password needed.</p>
     </li>
     <li><span class="num"></span>
       <h3>Pull a demo image</h3>
@@ -203,7 +203,7 @@
     </li>
     <li><span class="num"></span>
       <h3>Run it with a published port</h3>
-      <p>Hit <strong>Run</strong> on the image (or <strong>Containers → Run Container</strong>). Set a port mapping — host <code style="background:rgba(125,125,140,.12);padding:1px 6px;border-radius:5px">8088</code> → container <code style="background:rgba(125,125,140,.12);padding:1px 6px;border-radius:5px">80</code> — and run.</p>
+      <p>Hit <strong>Run</strong> on the image (or <strong>Containers → Run Container</strong>). Set a port mapping (host <code style="background:rgba(125,125,140,.12);padding:1px 6px;border-radius:5px">8088</code> → container <code style="background:rgba(125,125,140,.12);padding:1px 6px;border-radius:5px">80</code>) and run.</p>
     </li>
     <li><span class="num"></span>
       <h3>Open it</h3>
@@ -219,10 +219,10 @@
 <section class="wrap spaced">
   <h2>How is this different from Docker Desktop?</h2>
   <ul class="how">
-    <li><strong>It's Apple's engine.</strong> Each container runs in its own lightweight VM via Apple's Virtualization framework — sub-second boots, per-container IP addresses, optimized for Apple silicon.</li>
-    <li><strong>OCI all the way.</strong> Pulls from Docker Hub, ghcr.io, quay.io or any registry — including private images, with registry logins managed in Settings. Your existing images just work.</li>
-    <li><strong>Nothing between you and the daemon.</strong> Davit links Apple's own client library and speaks XPC directly — no socket shims, no license agreements, no accounts.</li>
-    <li><strong>Small footprint.</strong> One 17 MB app bundle — no Electron, no bundled VM image, no background services of its own.</li>
+    <li><strong>It's Apple's engine.</strong> Each container runs in its own lightweight VM via Apple's Virtualization framework; sub-second boots, per-container IP addresses, optimized for Apple silicon.</li>
+    <li><strong>OCI all the way.</strong> Pulls from Docker Hub, ghcr.io, quay.io or any registry, including private images, with registry logins managed in Settings. Your existing images just work.</li>
+    <li><strong>Nothing between you and the daemon.</strong> Davit links Apple's own client library and speaks XPC directly; no socket shims, no license agreements, no accounts.</li>
+    <li><strong>Small footprint.</strong> One 17 MB app bundle; no Electron, no bundled VM image, no background services of its own.</li>
   </ul>
 </section>
 
@@ -231,11 +231,11 @@
   <div class="faq">
     <details>
       <summary>How much memory does it use?</summary>
-      <p>The honest answer is architectural: there's <strong>no always-on multi-gigabyte Linux VM</strong>. Docker Desktop keeps one big VM running whether or not you have containers; Apple's platform instead boots a <em>separate lightweight VM per container</em>, sized to that container, and tears it down when the container stops. With nothing running, the platform's background services idle at roughly <strong>25&nbsp;MB</strong>. Davit itself is a native SwiftUI app (no Electron) — its footprint is mostly shared macOS framework memory. So the more containers you're <em>not</em> running, the less it costs you.</p>
+      <p>The honest answer is architectural: there's <strong>no always-on multi-gigabyte Linux VM</strong>. Docker Desktop keeps one big VM running whether or not you have containers; Apple's platform instead boots a <em>separate lightweight VM per container</em>, sized to that container, and tears it down when the container stops. With nothing running, the platform's background services idle at roughly <strong>25&nbsp;MB</strong>. Davit itself is a native SwiftUI app (no Electron); its footprint is mostly shared macOS framework memory. So the more containers you're <em>not</em> running, the less it costs you.</p>
     </details>
     <details>
       <summary>How does it compare to OrbStack?</summary>
-      <p>Honestly: if OrbStack already works for you, you won't switch for speed — it's excellent, and its shared-VM design is very fast. The engines differ, though. OrbStack is a commercial app with its own Docker-compatible virtualization layer; Davit is a free, open-source UI on <a href="https://github.com/apple/container">Apple's own container platform</a>, which boots a separate lightweight VM per container in well under a second and tears it down when the container stops. What you'd notice in practice: nothing resident when nothing is running, per-container IPs on a bridged network, stronger isolation between containers, and no license or account. What OrbStack still does better: drop-in <code>docker</code> CLI/API compatibility and broader tooling support. Both run standard OCI images.</p>
+      <p>Honestly: if OrbStack already works for you, you won't switch for speed; it's excellent, and its shared-VM design is very fast. The engines differ, though. OrbStack is a commercial app with its own Docker-compatible virtualization layer; Davit is a free, open-source UI on <a href="https://github.com/apple/container">Apple's own container platform</a>, which boots a separate lightweight VM per container in well under a second and tears it down when the container stops. What you'd notice in practice: nothing resident when nothing is running, per-container IPs on a bridged network, stronger isolation between containers, and no license or account. What OrbStack still does better: drop-in <code>docker</code> CLI/API compatibility and broader tooling support. Both run standard OCI images.</p>
     </details>
     <details>
       <summary>Can I reach a container by name from my Mac?</summary>
@@ -243,23 +243,23 @@
     </details>
     <details>
       <summary>Does it work with my docker-compose.yml?</summary>
-      <p>Yes, with a supported subset. <strong>Containers → ⋯ → Import Compose File</strong> parses the file and previews the plan — services in <code>depends_on</code> order, named volumes, networks, and the equivalent <code>container run</code> command per service — then creates and starts everything in one click. Supported: image, ports, environment, volumes (named &amp; bind), networks, resource limits, command, user, working_dir. Anything the importer can't honor (e.g. <code>restart:</code>, <code>healthcheck:</code>, <code>build:</code>) is listed as a warning up front rather than silently dropped. Apple's platform has no native compose, so Davit orchestrates the stack itself.</p>
+      <p>Yes, with a supported subset. <strong>Containers → ⋯ → Import Compose File</strong> parses the file and previews the plan: services in <code>depends_on</code> order, named volumes, networks, and the equivalent <code>container run</code> command per service. Then it creates and starts everything in one click. Supported: image, ports, environment, volumes (named &amp; bind), networks, resource limits, command, user, working_dir. Anything the importer can't honor (e.g. <code>restart:</code>, <code>healthcheck:</code>, <code>build:</code>) is listed as a warning up front rather than silently dropped. Apple's platform has no native compose, so Davit orchestrates the stack itself.</p>
     </details>
     <details>
       <summary>Can I build images from a Dockerfile?</summary>
-      <p>Yes — <strong>Images → Build Image</strong>. Davit talks to Apple's BuildKit-based builder directly (and starts it for you if it isn't running): pick the context folder and Dockerfile, set a tag and build args, and the built image lands in your library. One current platform limit worth knowing: Dockerfiles over 16&nbsp;KiB are rejected (an upstream <a href="https://github.com/apple/container/issues/735">apple/container bug</a>), and build contexts can't live under <code>/tmp</code>.</p>
+      <p>Yes: <strong>Images → Build Image</strong>. Davit talks to Apple's BuildKit-based builder directly (and starts it for you if it isn't running): pick the context folder and Dockerfile, set a tag and build args, and the built image lands in your library. One current platform limit worth knowing: Dockerfiles over 16&nbsp;KiB are rejected (an upstream <a href="https://github.com/apple/container/issues/735">apple/container bug</a>), and build contexts can't live under <code>/tmp</code>.</p>
     </details>
     <details>
       <summary>Can I pull private images?</summary>
-      <p>Yes. Sign in under <strong>Settings → Registries</strong> — Docker Hub, ghcr.io, quay.io or any OCI registry. Credentials are verified against the registry before being saved to your login keychain, and they're shared with the <code>container</code> CLI, so a login in Davit works for CLI pulls too (and vice-versa). For Docker Hub, use an access token rather than your password.</p>
+      <p>Yes. Sign in under <strong>Settings → Registries</strong>; Docker Hub, ghcr.io, quay.io or any OCI registry. Credentials are verified against the registry before being saved to your login keychain, and they're shared with the <code>container</code> CLI, so a login in Davit works for CLI pulls too (and vice-versa). For Docker Hub, use an access token rather than your password.</p>
     </details>
     <details>
       <summary>Is it signed and safe to run?</summary>
-      <p>Yes — every release is Developer ID signed and notarized by Apple, so it opens without Gatekeeper warnings. It's open source (MIT); you can read or build it yourself. It talks only to your local container daemon and to GitHub for update checks.</p>
+      <p>Yes. Every release is Developer ID signed and notarized by Apple, so it opens without Gatekeeper warnings. It's open source (MIT); you can read or build it yourself. It talks only to your local container daemon and to GitHub for update checks.</p>
     </details>
     <details>
       <summary>Do I need the <code>container</code> CLI installed?</summary>
-      <p>No. Davit talks to the platform directly over XPC. If the platform isn't present, Davit can download and install Apple's signed package for you on first launch — no admin password required. It can optionally add the <code>container</code> CLI to your shell from Settings if you want it.</p>
+      <p>No. Davit talks to the platform directly over XPC. If the platform isn't present, Davit can download and install Apple's signed package for you on first launch; no admin password required. It can optionally add the <code>container</code> CLI to your shell from Settings if you want it.</p>
     </details>
   </div>
 </section>
