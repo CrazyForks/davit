@@ -19,6 +19,7 @@ in-terminal shell (`davit exec`), and even launchd service bootstrap all go thro
   - *Stats*: live CPU %, memory, and disk-I/O charts (Swift Charts); tiles for CPU, memory, disk space used, network, and process count.
   - *Inspect*: pretty-printed raw JSON.
   - *Terminal*: opens an interactive shell in Terminal/iTerm (`davit exec` over XPC).
+  - *Files*: browse the container filesystem — navigate, download, upload, delete (over `exec` + copy in/out).
 - **Images** — pull with streaming progress, run-from-image, tag, delete, prune; per-image platform variants, size, digest, "used by" containers.
 - **Volumes** — create (with size), delete, prune, reveal backing image in Finder, in-use badges.
 - **Networks** — create (subnet / internal), delete, prune, attached-container counts.

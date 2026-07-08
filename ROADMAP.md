@@ -13,7 +13,7 @@ remaining A item is #2 (file browsing), intentionally scheduled in Wave 2.
 | # | Suggestion | Who | Type | Status |
 |---|---|---|---|---|
 | 1 | Getting-started tutorial on the site: a good demo image; the run dialog's `nginx:latest` default is a weak demo | simonw | Docs/site | ✅ done — 2-min walkthrough on site + README, `nginxdemos/hello` demo, pull-sheet suggestion updated |
-| 2 | In-container file browsing (list/download/upload files inside a container) | neodymiumphish (also in contained-app) | Feature | ⏳ Wave 2 |
+| 2 | In-container file browsing (list/download/upload/delete files inside a container) | neodymiumphish (also in contained-app) | Feature | ✅ done — Files tab (Wave 2) |
 | 3 | State the memory footprint — "Docker Desktop is a memory hog, what's Davit's?" | ballislife30 | Docs | ✅ done — FAQ (architectural framing; platform idles ~25 MB) |
 | 4 | Host→container name resolution / DNS | nvahalik; dofm suggests an Avahi/zeroconf alias trick | Docs (now) / feature (later) | ✅ doc done — FAQ documents the Avahi mDNS trick; built-in resolution still a later feature |
 | 5 | OrbStack comparison + efficiency framing | oulipo2 | Docs/FAQ | ✅ done — FAQ |
@@ -40,9 +40,10 @@ remaining A item is #2 (file browsing), intentionally scheduled in Wave 2.
 - (6) ✅ Menu bar already shipped.
 
 **Wave 2 — contained, high-value features:**
-- (2) In-container **file browser**: feasible today via `exec` (ls/stat) + `copyIn`/`copyOut`
-  (both already on ContainerClient). A new detail tab: browse tree, download/upload, delete.
-- "Reveal CLI command" affordance on run/exec/etc. — small, builds trust.
+- (2) ✅ In-container **file browser** — Files tab: breadcrumb navigation, download
+  (copyOut), upload (copyIn), delete; portable listing via `stat` with an `ls`
+  fallback. Backend covered by a selftest step.
+- "Reveal CLI command" affordance on run/exec/etc. — small, builds trust. (next)
 
 **Wave 3 — bigger bets (pick based on demand):**
 - Registry login management (unblocks private images cleanly).

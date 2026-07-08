@@ -10,9 +10,15 @@ struct ContainerDetailView: View {
         case overview = "Overview"
         case logs = "Logs"
         case stats = "Stats"
+        case files = "Files"
         case inspect = "Inspect"
     }
-    @State private var tab: Tab = ProcessInfo.processInfo.arguments.contains("--pose-tab-stats") ? .stats : .overview
+    @State private var tab: Tab = {
+        let args = ProcessInfo.processInfo.arguments
+        if args.contains("--pose-tab-stats") { return .stats }
+        if args.contains("--pose-tab-files") { return .files }
+        return .overview
+    }()
 
     private var container: ContainerRecord? {
         state.containers.first { $0.id == containerID }
@@ -92,7 +98,7 @@ struct ContainerDetailView: View {
             }
             .pickerStyle(.segmented)
             .labelsHidden()
-            .frame(width: 400)
+            .frame(width: 460)
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 14)
@@ -104,6 +110,7 @@ struct ContainerDetailView: View {
         case .overview: ContainerOverviewTab(container: c)
         case .logs: ContainerLogsTab(containerID: c.id)
         case .stats: ContainerStatsTab(container: c)
+        case .files: ContainerFilesTab(container: c)
         case .inspect: InspectTab(kind: "container", id: c.id)
         }
     }

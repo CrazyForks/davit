@@ -167,6 +167,48 @@ enum SelfTest {
             guard names.contains("davit-selftest-vol") else { throw CLIError(command: "selftest", message: "volume missing after create") }
             try await ContainerService.deleteVolume("davit-selftest-vol")
         }
+        await step("file browser: list → upload → download → delete") {
+            let name = "davit-fs-test"
+            try? await ContainerService.delete(name, force: true)
+            try await ContainerService.runContainer(
+                image: "alpine:latest", name: name,
+                processArgs: [], managementArgs: [], resourceArgs: [],
+                commandArgs: ["sleep", "120"])
+            defer { Task { try? await ContainerService.delete(name, force: true) } }
+
+            // list /: expect standard dirs (etc, bin, ...)
+            let root = try await ContainerService.listDirectory(name, path: "/")
+            guard root.contains(where: { $0.name == "etc" && $0.isDirectory }) else {
+                throw CLIError(command: "selftest", message: "/ listing missing etc dir: \(root.map(\.name))")
+            }
+            // upload a host file into /tmp, then list it back
+            let localURL = FileManager.default.temporaryDirectory.appendingPathComponent("davit-fs-\(UUID().uuidString).txt")
+            try "hello from davit\n".write(to: localURL, atomically: true, encoding: .utf8)
+            defer { try? FileManager.default.removeItem(at: localURL) }
+            try await ContainerService.uploadFile(name, hostURL: localURL, toDirectory: "/tmp")
+            let uploaded = localURL.lastPathComponent
+            let tmp = try await ContainerService.listDirectory(name, path: "/tmp")
+            guard let entry = tmp.first(where: { $0.name == uploaded }) else {
+                throw CLIError(command: "selftest", message: "uploaded file not found in /tmp")
+            }
+            guard entry.size == 17 else {
+                throw CLIError(command: "selftest", message: "wrong size after upload: \(entry.size) (want 17)")
+            }
+            // download it back and verify contents
+            let backURL = FileManager.default.temporaryDirectory.appendingPathComponent("davit-fs-back-\(UUID().uuidString).txt")
+            defer { try? FileManager.default.removeItem(at: backURL) }
+            try await ContainerService.downloadFile(name, containerPath: "/tmp/\(uploaded)", to: backURL)
+            let content = try String(contentsOf: backURL, encoding: .utf8)
+            guard content == "hello from davit\n" else {
+                throw CLIError(command: "selftest", message: "download content mismatch: \(content.debugDescription)")
+            }
+            // delete it inside the container
+            try await ContainerService.deletePath(name, path: "/tmp/\(uploaded)")
+            let after = try await ContainerService.listDirectory(name, path: "/tmp")
+            guard !after.contains(where: { $0.name == uploaded }) else {
+                throw CLIError(command: "selftest", message: "file still present after delete")
+            }
+        }
         await step("container run→stats→stop→start→delete") {
             try await ContainerService.runContainer(
                 image: "alpine:latest",
