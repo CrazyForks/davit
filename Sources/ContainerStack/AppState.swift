@@ -176,8 +176,11 @@ final class AppState: ObservableObject {
     }
 
     func refreshStats() async {
-        guard systemState.isRunning, !runningContainers.isEmpty else { return }
-        let ids = runningContainers.map(\.id)
+        guard systemState.isRunning else { return }
+        // Machines are backed by (hidden) containers — same stats API.
+        let machineBackings = machines.filter(\.isRunning).compactMap(\.containerId)
+        let ids = runningContainers.map(\.id) + machineBackings
+        guard !ids.isEmpty else { return }
         guard let raw = try? await ContainerService.stats(for: ids) else { return }
         let now = Date()
 

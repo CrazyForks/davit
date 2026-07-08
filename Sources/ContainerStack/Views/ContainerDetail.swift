@@ -306,16 +306,35 @@ struct ContainerLogsTab: View {
 
 struct ContainerStatsTab: View {
     @EnvironmentObject var state: AppState
-    let container: ContainerRecord
+    let statsID: String
+    let isRunning: Bool
+    let cpusAllocated: Int
+    let kindLabel: String
     var scrollable = true
 
-    private var history: [StatsSample] { state.statsHistory[container.id] ?? [] }
+    init(container: ContainerRecord, scrollable: Bool = true) {
+        self.statsID = container.id
+        self.isRunning = container.isRunning
+        self.cpusAllocated = Int(container.configuration.resources?.cpus ?? 0)
+        self.kindLabel = "container"
+        self.scrollable = scrollable
+    }
+
+    /// Machines chart the stats of their backing container.
+    init(machine: MachineRecord, backing: String) {
+        self.statsID = backing
+        self.isRunning = machine.isRunning
+        self.cpusAllocated = machine.cpus
+        self.kindLabel = "machine"
+    }
+
+    private var history: [StatsSample] { state.statsHistory[statsID] ?? [] }
     private var latest: StatsSample? { history.last }
 
     var body: some View {
-        if !container.isRunning {
-            EmptyState(icon: "chart.xyaxis.line", title: "Container not running",
-                       message: "Start the container to see live resource usage.")
+        if !isRunning {
+            EmptyState(icon: "chart.xyaxis.line", title: "Not running",
+                       message: "Start the \(kindLabel) to see live resource usage.")
         } else if history.count < 2 {
             VStack(spacing: 10) {
                 ProgressView()
@@ -334,7 +353,7 @@ struct ContainerStatsTab: View {
                     HStack(spacing: 14) {
                         StatTile(title: "CPU",
                                  value: String(format: "%.1f%%", latest?.cpuPercent ?? 0),
-                                 subtitle: "\(container.configuration.resources?.cpus ?? 0) CPUs allocated")
+                                 subtitle: "\(cpusAllocated) CPUs allocated")
                         StatTile(title: "Memory",
                                  value: formatBytes(latest?.memoryBytes),
                                  subtitle: "limit \(formatBytes(latest?.memoryLimit))")

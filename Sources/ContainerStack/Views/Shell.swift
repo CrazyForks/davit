@@ -62,6 +62,12 @@ struct MainWindow: View {
             }
             SnapshotDriver.runIfRequested(state: state)
             SnapshotDriver.runPoseIfRequested(selection: $selection)
+            if ProcessInfo.processInfo.arguments.contains("--pose-machine") {
+                Task { @MainActor in
+                    try? await Task.sleep(for: .seconds(5))
+                    selection = .machines
+                }
+            }
             if ProcessInfo.processInfo.arguments.contains("--pose-compose") {
                 Task { @MainActor in
                     try? await Task.sleep(for: .seconds(5))

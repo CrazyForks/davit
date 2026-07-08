@@ -471,6 +471,9 @@ enum ContainerService {
                 let index: ContainerizationOCI.Index?
             }
             return Backend.prettyJSON(Inspect(description: image.description, index: index))
+        case "machine":
+            let snapshot = try await MachineClient().inspect(id: id)
+            return Backend.prettyJSON(snapshot)
         case "network":
             let network = try await NetworkClient().get(id: id)
             return Backend.prettyJSON(network.configuration)
