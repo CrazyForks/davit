@@ -42,8 +42,13 @@ remaining A item is #2 (file browsing), intentionally scheduled in Wave 2.
 **Wave 2 — contained, high-value features:**
 - (2) ✅ In-container **file browser** — Files tab: breadcrumb navigation, download
   (copyOut), upload (copyIn), delete; portable listing via `stat` with an `ls`
-  fallback. Backend covered by a selftest step.
-- "Reveal CLI command" affordance on run/exec/etc. — small, builds trust. (next)
+  fallback. Rows show clear folder/file affordances (chevron vs. download button).
+  Backend covered by a selftest step. (shipped `a3e9902`)
+- ✅ **"Reveal CLI command"** — the Run sheet shows the equivalent `container run …`
+  command live as you fill the form, with copy. Teaches the CLI + builds trust
+  (Davit runs over XPC, not the CLI, so this is the "here's what it maps to").
+
+**Wave 2 is complete.** Next up is Wave 3 (registry login, Compose import, Dockerfile build) — demand-driven.
 
 **Wave 3 — bigger bets (pick based on demand):**
 - Registry login management (unblocks private images cleanly).

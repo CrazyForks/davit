@@ -178,14 +178,36 @@ struct RunContainerSheet: View {
                     Spacer()
                 }
             }
+
+            DetailCard(title: "Command line", icon: "terminal") {
+                HStack(alignment: .top, spacing: 8) {
+                    Text(cliPreview)
+                        .font(.system(size: 12, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(cliPreview, forType: .string)
+                    } label: {
+                        Image(systemName: "doc.on.doc")
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .help("Copy command")
+                }
+                Text("Davit runs this over the API — the equivalent `container` command, for reference.")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
         }
         .padding(16)
     }
 
-    private func run() {
-        running = true
-        errorText = nil
+    /// The four flag groups the form produces, shared by run() and the CLI preview.
+    private struct RunArgs { var process: [String]; var management: [String]; var resource: [String]; var command: [String] }
 
+    private func buildArgs() -> RunArgs {
         var processArgs: [String] = []
         for e in envVars where !e.key.isEmpty {
             processArgs += ["--env", "\(e.key)=\(e.value)"]
@@ -215,6 +237,36 @@ struct RunContainerSheet: View {
         } else {
             commandArgs = command.isEmpty ? [] : command.split(separator: " ").map(String.init)
         }
+        return RunArgs(process: processArgs, management: managementArgs, resource: resourceArgs, command: commandArgs)
+    }
+
+    /// The equivalent `container run …` for what the form will do. Davit actually
+    /// runs this over XPC — this is shown so you can see (and copy) the CLI form.
+    private var cliPreview: String {
+        let a = buildArgs()
+        var argv = ["container", "run", "--detach"]
+        if !name.isEmpty { argv += ["--name", name] }
+        argv += a.management + a.resource + a.process
+        argv.append(image.isEmpty ? "<image>" : image)
+        argv += a.command
+        return argv.map(Self.shellQuote).joined(separator: " ")
+    }
+
+    private static func shellQuote(_ s: String) -> String {
+        if s.isEmpty { return "''" }
+        if s.range(of: "^[A-Za-z0-9._:/=@,+-]+$", options: .regularExpression) != nil { return s }
+        return "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    private func run() {
+        running = true
+        errorText = nil
+
+        let args = buildArgs()
+        let processArgs = args.process
+        let managementArgs = args.management
+        let resourceArgs = args.resource
+        let commandArgs = args.command
         let containerName = name
         let replacing = recreate
 
