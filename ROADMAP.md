@@ -67,6 +67,28 @@ remaining A item is #2 (file browsing), intentionally scheduled in Wave 2.
   Davit rejects them with a clear message. Compose `build:` support is now
   unblocked (future).
 
+**Wave 4 — the thread's second round (shipped v0.1.9/v0.1.10):**
+- ✅ Terminal picker (Settings -> General): Terminal/iTerm2/Ghostty/WezTerm/kitty/Alacritty/Warp.
+- ✅ Settings fields typed "from the right" (trailing alignment) fixed.
+- ✅ Site: dead Avahi gist replaced with the platform's real `container system dns`
+  answer; de-AI copy pass; honest OrbStack perf FAQ.
+- ✅ Auto-start containers ("Start when Davit Opens" + services bootstrap at launch).
+- ✅ Images: Pull Latest (re-pull a tag to its newest digest).
+
+**Wave 5 — GitHub issues (shipped v0.1.11):**
+- ✅ #1 Machines: sidebar section, create/boot/stop/set-default/delete, detail view
+  (overview, streamed logs, live stats via the backing container, inspect),
+  one-click Terminal (machine login shell), edit cpus/memory/home-mount.
+  Headless: `Davit machine list|create|boot|stop|delete|exec|set`.
+- ✅ #2 Homebrew install roots (/opt/homebrew/opt/container + Intel prefix).
+- ✅ #7 Docker credential helpers: per-pull resolution from ~/.docker/config.json
+  (gcloud/ECR-style), staged into the keychain the pull daemon reads; covers
+  pulls, run auto-pull, compose, machine create. Build-time base images still
+  resolve in the shim (future).
+- ✅ #4/#5/#6 answered + FAQ ("replace Docker Desktop?", local images, compose).
+- Later: machine `.machine` DNS assumed default domain; devcontainers idea (#6);
+  compose `build:`; 1.1.0 platform bump (brew formula is ahead of our 1.0.0 pin).
+
 ## Feasibility notes (grounded in the API)
 - File browsing: `ContainerClient.exec` + `copyIn`/`copyOut` exist — no new daemon capability needed.
 - Registry login: the platform had `container registry login`; confirm the client surface before scoping.
