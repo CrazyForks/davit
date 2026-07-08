@@ -7,14 +7,17 @@ projects mentioned (contained-app, berth). Not commitments — a menu to priorit
 
 ## A. Direct suggestions from the thread
 
-| # | Suggestion | Who | Type | Effort | Impact |
-|---|---|---|---|---|---|
-| 1 | Getting-started tutorial on the site: a good demo image, screenshots or a silent video of getting it running; the run dialog's `nginx:latest` default is a weak demo | simonw | Docs/site | S | High |
-| 2 | In-container file browsing (list/download/upload files inside a container) | neodymiumphish (also in contained-app) | Feature | M | High |
-| 3 | State the memory footprint — "Docker Desktop is a memory hog, what's Davit's?" | ballislife30 | Docs (+ maybe a live stat) | S | Med |
-| 4 | Host→container name resolution / DNS (reach a container by name from the host) | nvahalik; dofm suggests an Avahi/zeroconf alias trick | Feature or docs | S (doc) / L (build) | Med |
-| 5 | OrbStack comparison + efficiency framing | oulipo2 | Docs/FAQ | S | Med |
-| 6 | Menu bar integration | mrbnprck | — already shipped | — | — |
+Status: **Wave 1 done** (shipped in `48a8a6a`, live on davit.app). The only
+remaining A item is #2 (file browsing), intentionally scheduled in Wave 2.
+
+| # | Suggestion | Who | Type | Status |
+|---|---|---|---|---|
+| 1 | Getting-started tutorial on the site: a good demo image; the run dialog's `nginx:latest` default is a weak demo | simonw | Docs/site | ✅ done — 2-min walkthrough on site + README, `nginxdemos/hello` demo, pull-sheet suggestion updated |
+| 2 | In-container file browsing (list/download/upload files inside a container) | neodymiumphish (also in contained-app) | Feature | ⏳ Wave 2 |
+| 3 | State the memory footprint — "Docker Desktop is a memory hog, what's Davit's?" | ballislife30 | Docs | ✅ done — FAQ (architectural framing; platform idles ~25 MB) |
+| 4 | Host→container name resolution / DNS | nvahalik; dofm suggests an Avahi/zeroconf alias trick | Docs (now) / feature (later) | ✅ doc done — FAQ documents the Avahi mDNS trick; built-in resolution still a later feature |
+| 5 | OrbStack comparison + efficiency framing | oulipo2 | Docs/FAQ | ✅ done — FAQ |
+| 6 | Menu bar integration | mrbnprck | — | ✅ already shipped |
 
 ## B. Feature gaps vs. contained-app / berth (context, not asks)
 
@@ -30,13 +33,11 @@ projects mentioned (contained-app, berth). Not commitments — a menu to priorit
 
 ## C. Proposed sequencing
 
-**Wave 1 — quick, high-leverage (mostly docs, ~an afternoon):**
-- (1) Getting-started section on davit.app + README: pick a demo image that *does something visible*
-  (e.g. a web app you open in the browser), with the existing screenshots.
-- (5) OrbStack/Docker Desktop comparison + (3) memory footprint, as a short FAQ on the site.
-  Measure Davit's real idle/active RSS to quote a number.
-- (4, doc form) Document the Avahi alias trick for host→container name resolution.
-- (6) Nothing to build; maybe make the menu bar more discoverable in docs.
+**Wave 1 — quick, high-leverage (mostly docs) — ✅ DONE (`48a8a6a`, live):**
+- (1) ✅ Getting-started section on davit.app + README using `nginxdemos/hello`.
+- (5) ✅ OrbStack/Docker comparison + (3) ✅ memory FAQ (architectural framing).
+- (4) ✅ Documented the Avahi alias trick for host→container name resolution.
+- (6) ✅ Menu bar already shipped.
 
 **Wave 2 — contained, high-value features:**
 - (2) In-container **file browser**: feasible today via `exec` (ls/stat) + `copyIn`/`copyOut`
