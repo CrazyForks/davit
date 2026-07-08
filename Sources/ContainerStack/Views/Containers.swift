@@ -80,6 +80,21 @@ struct ContainersView: View {
         .sheet(item: $composePlan) { plan in
             ComposeImportSheet(plan: plan)
         }
+        .task {
+            // Harness: `--pose-compose <file>` opens the import sheet on that file.
+            let args = ProcessInfo.processInfo.arguments
+            if let i = args.firstIndex(of: "--pose-compose"), i + 1 < args.count {
+                try? await Task.sleep(for: .seconds(2))
+                let url = URL(fileURLWithPath: args[i + 1])
+                if let text = try? String(contentsOf: url, encoding: .utf8) {
+                    let dir = url.deletingLastPathComponent()
+                    composePlan = try? Compose.parse(
+                        text: text, projectName: dir.lastPathComponent, baseDir: dir.path)
+                    try? await Task.sleep(for: .seconds(1))
+                    FileHandle.standardError.write(Data("POSED compose\n".utf8))
+                }
+            }
+        }
         .alert("Can't import compose file", isPresented: .init(
             get: { composeError != nil }, set: { if !$0 { composeError = nil } }
         )) {
