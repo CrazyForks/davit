@@ -25,6 +25,7 @@ enum SidebarSection: String, Hashable, CaseIterable {
 
 struct MainWindow: View {
     @EnvironmentObject var state: AppState
+    @Environment(\.openSettings) private var openSettings
     @State private var selection: SidebarSection? = .dashboard
 
     var body: some View {
@@ -59,6 +60,15 @@ struct MainWindow: View {
             }
             SnapshotDriver.runIfRequested(state: state)
             SnapshotDriver.runPoseIfRequested(selection: $selection)
+            if ProcessInfo.processInfo.arguments.contains("--pose-settings-registries") {
+                Task { @MainActor in
+                    try? await Task.sleep(for: .seconds(6))
+                    openSettings()
+                    NSApp.activate(ignoringOtherApps: true)
+                    try? await Task.sleep(for: .seconds(2))
+                    FileHandle.standardError.write(Data("POSED settings-registries\n".utf8))
+                }
+            }
             if ProcessInfo.processInfo.arguments.contains(where: { $0.hasPrefix("--probe-recreate") }) {
                 Task { @MainActor in
                     try? await Task.sleep(for: .seconds(6))

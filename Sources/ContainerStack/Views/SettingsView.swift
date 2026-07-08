@@ -1,18 +1,28 @@
 import SwiftUI
 
 struct SettingsView: View {
+    private enum Tab { case general, platform, registries, about }
+    // Harness: `--pose-settings-registries` lands on the Registries tab for screenshots.
+    @State private var tab: Tab =
+        ProcessInfo.processInfo.arguments.contains("--pose-settings-registries") ? .registries : .general
+
     var body: some View {
-        TabView {
+        TabView(selection: $tab) {
             GeneralSettings()
                 .tabItem { Label("General", systemImage: "gearshape") }
+                .tag(Tab.general)
             SystemSettings()
                 .tabItem { Label("Platform", systemImage: "wrench.and.screwdriver") }
+                .tag(Tab.platform)
             RegistrySettings()
                 .tabItem { Label("Registries", systemImage: "key") }
+                .tag(Tab.registries)
             AboutSettings()
                 .tabItem { Label("About", systemImage: "info.circle") }
+                .tag(Tab.about)
         }
-        .frame(width: 560, height: 600)
+        // Compact height when posing for screenshots — the registries list is short.
+        .frame(width: 560, height: ProcessInfo.processInfo.arguments.contains("--pose-settings-registries") ? 400 : 600)
     }
 }
 

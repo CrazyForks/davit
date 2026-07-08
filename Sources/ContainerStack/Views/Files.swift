@@ -6,7 +6,15 @@ struct ContainerFilesTab: View {
     @EnvironmentObject var state: AppState
     let container: ContainerRecord
 
-    @State private var path = "/"
+    @State private var path = Self.initialPath
+
+    /// Harness: `--pose-files-path /etc` starts the browser somewhere with
+    /// real files in it, for screenshots.
+    private static var initialPath: String {
+        let args = ProcessInfo.processInfo.arguments
+        if let i = args.firstIndex(of: "--pose-files-path"), i + 1 < args.count { return args[i + 1] }
+        return "/"
+    }
     @State private var entries: [FileEntry] = []
     @State private var loading = false
     @State private var error: String?
@@ -64,7 +72,8 @@ struct ContainerFilesTab: View {
                     Button(seg.label) { path = seg.path }
                         .buttonStyle(.plain)
                         .foregroundStyle(idx == segments.count - 1 ? Color.primary : Color.secondary)
-                    if idx < segments.count - 1 {
+                    // Root's label is already "/" — only separate later segments.
+                    if idx > 0 && idx < segments.count - 1 {
                         Text("/").foregroundStyle(.tertiary)
                     }
                 }

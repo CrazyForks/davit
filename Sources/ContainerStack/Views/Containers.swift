@@ -69,10 +69,17 @@ struct ContainersView: View {
         .task {
             if ProcessInfo.processInfo.arguments.contains("--probe-recreate-detail")
                 || ProcessInfo.processInfo.arguments.contains("--pose-detail") {
+                // `--pose-container <id>` picks which container to pose; default first.
+                let args = ProcessInfo.processInfo.arguments
+                let wanted = args.firstIndex(of: "--pose-container").flatMap { i in
+                    i + 1 < args.count ? args[i + 1] : nil
+                }
                 for _ in 0..<20 {
-                    if let first = state.containers.first {
-                        path.append(first.id)
-                        FileHandle.standardError.write(Data("DBG probe: pushed detail \(first.id)\n".utf8))
+                    let target = wanted.flatMap { id in state.containers.first { $0.id == id } }
+                        ?? state.containers.first
+                    if let target {
+                        path.append(target.id)
+                        FileHandle.standardError.write(Data("DBG probe: pushed detail \(target.id)\n".utf8))
                         break
                     }
                     try? await Task.sleep(for: .seconds(1))
