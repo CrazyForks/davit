@@ -248,6 +248,8 @@ enum ContainerService {
         commandArgs: [String]
     ) async throws {
         do {
+            // The run path auto-pulls missing images; stage helper credentials first.
+            await DockerCredentialHelpers.refreshCredentials(forReference: image)
             let config = try await Backend.systemConfig()
             let id = Utility.createContainerID(name: name?.isEmpty == true ? nil : name)
             try Utility.validEntityName(id)
@@ -291,6 +293,7 @@ enum ContainerService {
 
     static func pullImage(_ reference: String, progress: @escaping @Sendable ([ProgressUpdateEvent]) async -> Void) async throws {
         do {
+            await DockerCredentialHelpers.refreshCredentials(forReference: reference)
             let config = try await Backend.systemConfig()
             _ = try await ClientImage.pull(
                 reference: reference,

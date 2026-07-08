@@ -62,6 +62,7 @@ enum MachineService {
     ) async throws {
         do {
             try Utility.validEntityName(name)
+            await DockerCredentialHelpers.refreshCredentials(forReference: image)
             let systemConfig = try await Backend.systemConfig()
             let bootConfig = try systemConfig.machine.with(
                 [

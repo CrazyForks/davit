@@ -78,6 +78,22 @@ enum Main {
             semaphore.wait()
             return
         }
+        if args.count >= 3, args[1] == "pull" {
+            let reference = args[2]
+            let semaphore = DispatchSemaphore(value: 0)
+            Task.detached {
+                do {
+                    try await ContainerService.pullImage(reference) { _ in }
+                    print("pull: ok — \(reference)")
+                    exit(0)
+                } catch {
+                    let message = (error as? CLIError)?.message ?? String(describing: error)
+                    FileHandle.standardError.write(Data("pull failed: \(message)\n".utf8)); exit(1)
+                }
+            }
+            semaphore.wait()
+            return
+        }
         if args.count >= 2, args[1] == "machine" {
             // usage: machine list | machine create <image> <name> | machine stop|boot|delete <name>
             let sub = args.count >= 3 ? args[2] : "list"

@@ -259,7 +259,7 @@
     </details>
     <details>
       <summary>Can I pull private images?</summary>
-      <p>Yes. Sign in under <strong>Settings → Registries</strong>; Docker Hub, ghcr.io, quay.io or any OCI registry. Credentials are verified against the registry before being saved to your login keychain, and they're shared with the <code>container</code> CLI, so a login in Davit works for CLI pulls too (and vice-versa). For Docker Hub, use an access token rather than your password.</p>
+      <p>Yes. Sign in under <strong>Settings → Registries</strong>; Docker Hub, ghcr.io, quay.io or any OCI registry. Credentials are verified against the registry before being saved to your login keychain, and they're shared with the <code>container</code> CLI, so a login in Davit works for CLI pulls too (and vice-versa). For Docker Hub, use an access token rather than your password. Registries that use Docker credential helpers (Google Artifact Registry via gcloud, ECR, and friends) work too: if <code>~/.docker/config.json</code> names a helper for the registry, Davit invokes it right before each pull, so short-lived tokens are always fresh.</p>
     </details>
     <details>
       <summary>Is it signed and safe to run?</summary>

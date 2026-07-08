@@ -56,7 +56,7 @@ enum RegistryService {
     /// information" separately — and every re-login resets any Always Allow.
     /// Attributes match KeychainQuery.save exactly so the platform's lookups
     /// keep finding the item.
-    private static func saveTrustingPlatform(hostname: String, username: String, password: String) throws {
+    static func saveTrustingPlatform(hostname: String, username: String, password: String) throws {
         try? keychain.delete(hostname: hostname)  // replace any existing item
 
         var query: [String: Any] = [
