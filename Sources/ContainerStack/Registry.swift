@@ -1,6 +1,7 @@
 import ContainerizationOCI
 import ContainerizationOS
 import Foundation
+import Security
 
 /// A saved registry login (credentials live in the login keychain, not here).
 struct RegistryLoginRecord: Identifiable, Hashable {
@@ -43,10 +44,70 @@ enum RegistryService {
             throw CLIError(command: "registry login \(server)", message: "authentication failed: \(String(describing: error))")
         }
         do {
-            try keychain.save(hostname: server, username: username, password: password)
+            try saveTrustingPlatform(hostname: server, username: username, password: password)
         } catch {
             throw CLIError(command: "registry login \(server)", message: "credentials verified but keychain save failed: \(error.localizedDescription)")
         }
+    }
+
+    /// Saves the credential with an ACL that pre-trusts the container platform's
+    /// binaries (apiserver, the core-images helper that performs pulls, and the
+    /// CLI). Without this, each of those prompts "wants to use your confidential
+    /// information" separately — and every re-login resets any Always Allow.
+    /// Attributes match KeychainQuery.save exactly so the platform's lookups
+    /// keep finding the item.
+    private static func saveTrustingPlatform(hostname: String, username: String, password: String) throws {
+        try? keychain.delete(hostname: hostname)  // replace any existing item
+
+        var query: [String: Any] = [
+            kSecClass as String: kSecClassInternetPassword,
+            kSecAttrSecurityDomain as String: keychainDomain,
+            kSecAttrServer as String: hostname,
+            kSecAttrAccount as String: username,
+            kSecValueData as String: Data(password.utf8),
+            kSecAttrSynchronizable as String: false,
+        ]
+        if let access = platformAccess(label: "container registry \(hostname)") {
+            query[kSecAttrAccess as String] = access
+        }
+        let status = SecItemAdd(query as CFDictionary, nil)
+        guard status == errSecSuccess else {
+            throw CLIError(command: "registry login \(hostname)", message: "SecItemAdd failed: \(status)")
+        }
+    }
+
+    /// ACL trusting Davit plus every platform binary that reads registry
+    /// credentials, across all install roots present on this machine.
+    /// SecTrustedApplication/SecAccess are deprecated but remain the only way
+    /// to pre-authorize other apps on file-based keychain items.
+    private static func platformAccess(label: String) -> SecAccess? {
+        var apps: [SecTrustedApplication] = []
+        var selfApp: SecTrustedApplication?
+        if SecTrustedApplicationCreateFromPath(nil, &selfApp) == errSecSuccess, let selfApp {
+            apps.append(selfApp)
+        }
+        var roots = [PlatformInstaller.managedRoot, "/usr/local"]
+        if let resolved = ContainerBinary.resolve(), !roots.contains(resolved.installRoot) {
+            roots.append(resolved.installRoot)
+        }
+        let helpers = [
+            "bin/container",
+            "bin/container-apiserver",
+            "libexec/container/plugins/container-core-images/bin/container-core-images",
+        ]
+        for root in roots {
+            for helper in helpers {
+                let path = "\(root)/\(helper)"
+                guard FileManager.default.isExecutableFile(atPath: path) else { continue }
+                var app: SecTrustedApplication?
+                if SecTrustedApplicationCreateFromPath(path, &app) == errSecSuccess, let app {
+                    apps.append(app)
+                }
+            }
+        }
+        var access: SecAccess?
+        guard SecAccessCreate(label as CFString, apps as CFArray, &access) == errSecSuccess else { return nil }
+        return access
     }
 
     static func logout(server rawServer: String) throws {

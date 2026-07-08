@@ -12,6 +12,7 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.3.0"),
         .package(url: "https://github.com/apple/swift-log.git", from: "1.0.0"),
         .package(url: "https://github.com/jpsim/Yams.git", from: "6.2.1"),
+        .package(url: "https://github.com/apple/swift-nio.git", from: "2.80.0"),
     ],
     targets: [
         .executableTarget(
@@ -28,6 +29,10 @@ let package = Package(
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
                 .product(name: "Logging", package: "swift-log"),
                 .product(name: "Yams", package: "Yams"),
+                .product(name: "ContainerBuild", package: "container"),
+                .product(name: "ContainerCommands", package: "container"),
+                .product(name: "ContainerImagesService", package: "container"),
+                .product(name: "NIO", package: "swift-nio"),
             ],
             path: "Sources/ContainerStack",
             swiftSettings: [.swiftLanguageMode(.v5)]

@@ -24,6 +24,7 @@ in-terminal shell (`davit exec`), and even launchd service bootstrap all go thro
 - **Volumes** — create (with size), delete, prune, reveal backing image in Finder, in-use badges.
 - **Networks** — create (subnet / internal), delete, prune, attached-container counts.
 - **Run Container sheet** — image picker, name, command, ports, env vars, volume/bind mounts, CPU/memory limits, network selection.
+- **Build images** — Images → Build Image: pick a context folder and Dockerfile, set tag/build-args, and Davit drives the platform's BuildKit builder (starting it if needed), then loads and tags the result into the image store. `Davit build -t <tag> <context-dir>` headless.
 - **Compose import** — Containers → ⋯ → Import Compose File: parses a `docker-compose.yml`, previews exactly what will be created (services in `depends_on` order, named volumes, networks, the equivalent `container run` command per service, and warnings for anything unsupported), then creates and starts the stack. `Davit compose plan|up <file>` headless.
 - **Registries** — sign in to Docker Hub / ghcr.io / any registry to pull private images (Settings → Registries); credentials are verified against the registry and stored in the login keychain, shared with the `container` CLI.
 - **Menu bar extra** — service status, per-container quick actions from anywhere.
@@ -141,6 +142,7 @@ Davit system start|stop          # bootstrap / tear down the container launchd s
 Davit platform install|remove    # download + verify Apple's signed pkg into an app-managed install root
 Davit registry login|list|logout # registry credentials (login reads the password from stdin)
 Davit compose plan|up <file>     # parse a compose file (plan: print only) / create & start the stack
+Davit build -t <tag> <dir>       # build an image from <dir>/Dockerfile via the BuildKit shim
 Davit --snapshot /tmp/shots      # render every screen to PNGs via ImageRenderer (no screen-recording permission)
 ```
 

@@ -59,7 +59,13 @@ remaining A item is #2 (file browsing), intentionally scheduled in Wave 2.
   volumes (named/bind/tmpfs, ro), networks, cpus/mem_limit + deploy.resources.limits,
   command, user, working_dir, depends_on (order only). `build:` not yet.
   Headless: `Davit compose plan|up <file>`; parser covered by a selftest step.
-- Image build from a Dockerfile (would also unlock compose `build:`).
+- ✅ Image build from a Dockerfile — Images → Build Image: context/Dockerfile
+  pickers, tag, build args, no-cache/re-pull toggles; drives the platform's
+  BuildKit shim over vsock (auto-starting the builder), exports OCI, loads +
+  unpacks + tags into the image store. Headless: `Davit build -t <tag> <dir>`.
+  Known platform quirk: contexts under /tmp fail in the platform's file sync —
+  Davit rejects them with a clear message. Compose `build:` support is now
+  unblocked (future).
 
 ## Feasibility notes (grounded in the API)
 - File browsing: `ContainerClient.exec` + `copyIn`/`copyOut` exist — no new daemon capability needed.

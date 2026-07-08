@@ -78,6 +78,40 @@ enum Main {
             semaphore.wait()
             return
         }
+        if args.count >= 2, args[1] == "build" {
+            // usage: build -t <tag> [-f <dockerfile>] [--no-cache] <context-dir>
+            var tag: String?, file: String?, noCache = false, context: String?
+            var i = 2
+            while i < args.count {
+                switch args[i] {
+                case "-t", "--tag": if i + 1 < args.count { tag = args[i + 1]; i += 1 }
+                case "-f", "--file": if i + 1 < args.count { file = args[i + 1]; i += 1 }
+                case "--no-cache": noCache = true
+                default: context = args[i]
+                }
+                i += 1
+            }
+            guard let tag, let context else {
+                FileHandle.standardError.write(Data("usage: build -t <tag> [-f <dockerfile>] [--no-cache] <context-dir>\n".utf8)); exit(2)
+            }
+            let contextDir = (context as NSString).expandingTildeInPath
+            let dockerfile = file.map { ($0 as NSString).expandingTildeInPath } ?? "\(contextDir)/Dockerfile"
+            let request = BuildService.Request(
+                contextDir: contextDir, dockerfilePath: dockerfile, tag: tag, noCache: noCache)
+            let semaphore = DispatchSemaphore(value: 0)
+            Task.detached {
+                do {
+                    let image = try await BuildService.build(request) { print($0) }
+                    print("build: ok — \(image)")
+                    exit(0)
+                } catch {
+                    let message = (error as? CLIError)?.message ?? String(describing: error)
+                    FileHandle.standardError.write(Data("build failed: \(message)\n".utf8)); exit(1)
+                }
+            }
+            semaphore.wait()
+            return
+        }
         if args.count >= 2, args[1] == "compose" {
             // usage: compose plan <file>   (parse + print, no side effects)
             //        compose up <file>     (create volumes/networks, run services)

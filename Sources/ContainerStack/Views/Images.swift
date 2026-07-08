@@ -4,6 +4,7 @@ struct ImagesView: View {
     @EnvironmentObject var state: AppState
     @State private var search = ""
     @State private var showPullSheet = false
+    @State private var showBuildSheet = false
     @State private var runFromImage: ImageRecord?
     @State private var path: [ImageRecord] = []
 
@@ -42,6 +43,13 @@ struct ImagesView: View {
                     }
                     .help("Pull an image from a registry")
 
+                    Button {
+                        showBuildSheet = true
+                    } label: {
+                        Label("Build Image", systemImage: "hammer")
+                    }
+                    .help("Build an image from a Dockerfile")
+
                     Menu {
                         Button("Prune Unused Images", role: .destructive) {
                             state.perform("images") { try await ContainerService.pruneImages(all: true) }
@@ -57,6 +65,8 @@ struct ImagesView: View {
         .sheet(item: $runFromImage) { image in
             RunContainerSheet(prefilledImage: image.name)
         }
+        // Third anchor node for the same reason.
+        .background(EmptyView().sheet(isPresented: $showBuildSheet) { BuildImageSheet() })
     }
 
     private var list: some View {
