@@ -7,6 +7,8 @@ struct SettingsView: View {
                 .tabItem { Label("General", systemImage: "gearshape") }
             SystemSettings()
                 .tabItem { Label("Platform", systemImage: "wrench.and.screwdriver") }
+            RegistrySettings()
+                .tabItem { Label("Registries", systemImage: "key") }
             AboutSettings()
                 .tabItem { Label("About", systemImage: "info.circle") }
         }

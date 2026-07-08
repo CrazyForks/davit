@@ -44,6 +44,40 @@ enum Main {
                 exit(1)
             }
         }
+        if args.count >= 2, args[1] == "registry" {
+            let sub = args.count >= 3 ? args[2] : "list"
+            let semaphore = DispatchSemaphore(value: 0)
+            Task.detached {
+                do {
+                    switch sub {
+                    case "list":
+                        for r in RegistryService.listLogins() { print("\(r.hostname)\t\(r.username)") }
+                    case "login":
+                        // usage: registry login <server> <username>   (password on stdin)
+                        guard args.count >= 5 else {
+                            FileHandle.standardError.write(Data("usage: registry login <server> <username> (password via stdin)\n".utf8)); exit(2)
+                        }
+                        let pw = String(decoding: FileHandle.standardInput.readDataToEndOfFile(), as: UTF8.self)
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                        try await RegistryService.login(server: args[3], username: args[4], password: pw)
+                        print("registry login: ok")
+                    case "logout":
+                        guard args.count >= 4 else {
+                            FileHandle.standardError.write(Data("usage: registry logout <server>\n".utf8)); exit(2)
+                        }
+                        try RegistryService.logout(server: args[3])
+                        print("registry logout: ok")
+                    default:
+                        FileHandle.standardError.write(Data("unknown registry subcommand: \(sub)\n".utf8)); exit(2)
+                    }
+                    exit(0)
+                } catch {
+                    FileHandle.standardError.write(Data("registry \(sub) failed: \(error)\n".utf8)); exit(1)
+                }
+            }
+            semaphore.wait()
+            return
+        }
         if args.count >= 3, args[1] == "platform", args[2] == "install" || args[2] == "remove" {
             let action = args[2]
             let semaphore = DispatchSemaphore(value: 0)
@@ -266,6 +300,15 @@ enum SelfTest {
             let final = try await SystemConfigStore.load()
             guard final.effective["dns"]?["domain"] == nil || final.effective["dns"]?["domain"] is NSNull else {
                 throw CLIError(command: "selftest", message: "override not removed on revert")
+            }
+        }
+        await step("registry: list + reject bad credentials") {
+            _ = RegistryService.listLogins()  // must not throw
+            do {
+                try await RegistryService.login(server: "docker.io", username: "davit-selftest-nouser", password: "definitely-invalid-\(UUID().uuidString)")
+                throw CLIError(command: "selftest", message: "bad credentials were accepted")
+            } catch let e as CLIError where e.command.hasPrefix("registry login") {
+                // expected: authentication rejected
             }
         }
         await step("inspect container JSON") {

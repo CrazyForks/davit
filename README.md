@@ -24,6 +24,7 @@ in-terminal shell (`davit exec`), and even launchd service bootstrap all go thro
 - **Volumes** — create (with size), delete, prune, reveal backing image in Finder, in-use badges.
 - **Networks** — create (subnet / internal), delete, prune, attached-container counts.
 - **Run Container sheet** — image picker, name, command, ports, env vars, volume/bind mounts, CPU/memory limits, network selection.
+- **Registries** — sign in to Docker Hub / ghcr.io / any registry to pull private images (Settings → Registries); credentials are verified against the registry and stored in the login keychain, shared with the `container` CLI.
 - **Menu bar extra** — service status, per-container quick actions from anywhere.
 - **Open at login** — optional launch-to-menu-bar at login (Settings → General), via `SMAppService`.
 - **In-app updates** — checks GitHub Releases daily (or on demand from About); one click downloads the new version, verifies its Developer ID signature (team must match), swaps the bundle atomically with rollback, and relaunches. `Davit update check|install` headless.

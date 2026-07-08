@@ -50,8 +50,8 @@ remaining A item is #2 (file browsing), intentionally scheduled in Wave 2.
 
 **Wave 2 is complete.** Next up is Wave 3 (registry login, Compose import, Dockerfile build) — demand-driven.
 
-**Wave 3 — bigger bets (pick based on demand):**
-- Registry login management (unblocks private images cleanly).
+**Wave 3 — bigger bets:**
+- ✅ Registry login management — Settings → Registries: add/list/remove logins, validated against the registry, stored in the login keychain (shared with the CLI). Headless: `Davit registry login|list|logout`.
 - Docker Compose import (most-requested class of feature in this space).
 - Image build from a Dockerfile.
 
