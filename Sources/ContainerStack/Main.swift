@@ -115,6 +115,23 @@ enum Main {
         if args.count >= 2, args[1] == "machine" {
             // usage: machine list | machine create <image> <name> | machine stop|boot|delete <name>
             let sub = args.count >= 3 ? args[2] : "list"
+            if sub == "exec" {
+                guard args.count >= 4 else {
+                    FileHandle.standardError.write(Data("usage: machine exec <name>\n".utf8)); exit(2)
+                }
+                let semaphore = DispatchSemaphore(value: 0)
+                Task.detached {
+                    do {
+                        let code = try await MachineService.execShell(machineID: args[3])
+                        exit(code)
+                    } catch {
+                        let message = (error as? CLIError)?.message ?? String(describing: error)
+                        FileHandle.standardError.write(Data("machine exec failed: \(message)\n".utf8)); exit(1)
+                    }
+                }
+                semaphore.wait()
+                return
+            }
             let semaphore = DispatchSemaphore(value: 0)
             Task.detached {
                 do {
@@ -131,6 +148,24 @@ enum Main {
                             image: args[3], name: args[4], cpus: nil, memory: nil,
                             setDefault: false, progress: { print($0) })
                         print("machine create: ok")
+                    case "set":
+                        // machine set <name> [cpus=N] [memory=SIZE] [home-mount=rw|ro|none]
+                        guard args.count >= 5 else {
+                            FileHandle.standardError.write(Data("usage: machine set <name> key=value...\n".utf8)); exit(2)
+                        }
+                        var cpus: Int?, memory: String?, homeMount: String?
+                        for kv in args[4...] {
+                            let parts = kv.split(separator: "=", maxSplits: 1).map(String.init)
+                            guard parts.count == 2 else { continue }
+                            switch parts[0] {
+                            case "cpus": cpus = Int(parts[1])
+                            case "memory": memory = parts[1]
+                            case "home-mount": homeMount = parts[1]
+                            default: break
+                            }
+                        }
+                        try await MachineService.setConfig(args[3], cpus: cpus, memory: memory, homeMount: homeMount)
+                        print("machine set: ok")
                     case "boot", "stop", "delete":
                         guard args.count >= 4 else {
                             FileHandle.standardError.write(Data("usage: machine \(sub) <name>\n".utf8)); exit(2)

@@ -72,6 +72,9 @@ struct MachinesView: View {
                             state.perform(machine.id) { try await MachineService.boot(machine.id) }
                         }
                     }
+                    if machine.isRunning {
+                        Button("Open Terminal") { TerminalLauncher.openMachineShell(machineID: machine.id) }
+                    }
                     Button("Set as Default") {
                         state.perform(machine.id) { try await MachineService.setDefault(machine.id) }
                     }
@@ -261,6 +264,7 @@ struct MachineDetailView: View {
         case stats = "Stats"
         case inspect = "Inspect"
     }
+    @State private var showEditSheet = false
     @State private var tab: Tab =
         ProcessInfo.processInfo.arguments.contains("--pose-machine-tab-stats") ? .stats
         : ProcessInfo.processInfo.arguments.contains("--pose-machine-tab-inspect") ? .inspect
@@ -284,6 +288,11 @@ struct MachineDetailView: View {
             }
         }
         .navigationTitle(machineID)
+        .sheet(isPresented: $showEditSheet) {
+            if let machine {
+                EditMachineSheet(machine: machine)
+            }
+        }
         .toolbar {
             if let machine {
                 ToolbarItemGroup(placement: .primaryAction) {
@@ -301,6 +310,11 @@ struct MachineDetailView: View {
                         } label: {
                             Label("Stop", systemImage: "stop.fill")
                         }.help("Stop machine")
+                        Button {
+                            TerminalLauncher.openMachineShell(machineID: machine.id)
+                        } label: {
+                            Label("Terminal", systemImage: "terminal")
+                        }.help("Open shell in Terminal")
                     } else {
                         Button {
                             state.perform(machine.id) { try await MachineService.boot(machine.id) }
@@ -309,6 +323,7 @@ struct MachineDetailView: View {
                         }.help("Boot machine")
                     }
                     Menu {
+                        Button("Edit\u{2026}") { showEditSheet = true }
                         Button("Set as Default") {
                             state.perform(machine.id) { try await MachineService.setDefault(machine.id) }
                         }
@@ -418,5 +433,91 @@ struct MachineOverviewTab: View {
             }
         }
         .padding(16)
+    }
+}
+
+
+/// Edit a machine's boot config (`container machine set`); the platform
+/// applies changes on the next boot.
+struct EditMachineSheet: View {
+    @EnvironmentObject var state: AppState
+    @Environment(\.dismiss) private var dismiss
+    let machine: MachineRecord
+
+    @State private var cpus = ""
+    @State private var memory = ""
+    @State private var homeMount = "rw"
+    @State private var working = false
+    @State private var errorText: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Edit \(machine.id)").font(.title3.weight(.semibold))
+            Text(machine.isRunning
+                 ? "Changes apply after the machine is stopped and booted again."
+                 : "Changes apply on the next boot.")
+                .font(.caption).foregroundStyle(.secondary)
+
+            Form {
+                HStack {
+                    TextField("CPUs", text: $cpus)
+                        .textFieldStyle(.roundedBorder)
+                    TextField("Memory (e.g. 8G)", text: $memory)
+                        .textFieldStyle(.roundedBorder)
+                }
+                Picker("Home directory", selection: $homeMount) {
+                    Text("Mounted read-write").tag("rw")
+                    Text("Mounted read-only").tag("ro")
+                    Text("Not mounted").tag("none")
+                }
+            }
+            .formStyle(.columns)
+
+            if let errorText {
+                Text(errorText).font(.caption).foregroundStyle(.red)
+                    .textSelection(.enabled).lineLimit(4)
+            }
+
+            HStack {
+                if working { ProgressView().controlSize(.small) }
+                Spacer()
+                Button("Cancel") { dismiss() }
+                Button("Save") { save() }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(working)
+            }
+        }
+        .padding(20)
+        .frame(width: 420)
+        .onAppear {
+            cpus = "\(machine.cpus)"
+            // Binary units to match the platform ("64G" = GiB); decimal
+            // formatBytes output would silently shrink/grow the value.
+            let gib = machine.memoryBytes / 1_073_741_824
+            memory = gib >= 1 && machine.memoryBytes % 1_073_741_824 == 0
+                ? "\(gib)G" : "\(machine.memoryBytes / 1_048_576)M"
+            homeMount = machine.homeMount
+        }
+    }
+
+    private func save() {
+        working = true
+        errorText = nil
+        Task {
+            do {
+                try await MachineService.setConfig(
+                    machine.id,
+                    cpus: Int(cpus),
+                    memory: memory,
+                    homeMount: homeMount)
+                await state.refreshAll()
+                dismiss()
+            } catch let e as CLIError {
+                errorText = e.message
+            } catch {
+                errorText = error.localizedDescription
+            }
+            working = false
+        }
     }
 }

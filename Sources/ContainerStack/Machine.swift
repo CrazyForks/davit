@@ -1,8 +1,11 @@
 import ContainerAPIClient
 import ContainerCommands
 import ContainerPersistence
+import ContainerResource
+import ContainerizationOS
 import Foundation
 import MachineAPIClient
+import SystemPackage
 
 /// A container machine (micro VM) as shown in the UI.
 struct MachineRecord: Identifiable, Hashable {
@@ -126,6 +129,69 @@ enum MachineService {
         } catch {
             throw CLIError.wrap("machine inspect \(id)", error)
         }
+    }
+
+    /// Update boot config (`container machine set`); takes effect after the
+    /// machine is stopped and booted again.
+    static func setConfig(_ id: String, cpus: Int?, memory: String?, homeMount: String?) async throws {
+        do {
+            let snapshot = try await MachineClient().inspect(id: id)
+            let updated = try snapshot.bootConfig.with(
+                [
+                    "cpus": cpus.map { "\($0)" },
+                    "memory": memory?.isEmpty == true ? nil : memory,
+                    "home-mount": homeMount,
+                ].compactMapValues { $0 })
+            try await MachineClient().setConfig(id: id, bootConfig: updated)
+        } catch {
+            throw CLIError.wrap("machine set \(id)", error)
+        }
+    }
+
+    /// Interactive login shell into a machine over the XPC API — the same
+    /// process `container machine run -n <id>` creates: the machine-init
+    /// binary with `-s` resolves the provisioned user's login shell.
+    static func execShell(machineID: String) async throws -> Int32 {
+        let client = MachineClient()
+        var snapshot = try await client.inspect(id: machineID)
+        if snapshot.status.rawValue != "running" {
+            snapshot = try await client.boot(id: machineID)
+        }
+        guard let containerId = snapshot.containerId else {
+            throw CLIError(command: "machine exec \(machineID)", message: "machine has no backing container")
+        }
+
+        let executablePath = FilePath("/\(MachineBundle.sbinDirectory)").appending(MachineBundle.initFile).string
+        // Mirror MachineRun's cwd logic: land in the mounted home when we can.
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let cwd: String
+        if snapshot.bootConfig.homeMount != .none, FileManager.default.currentDirectoryPath.hasPrefix(home) {
+            cwd = FileManager.default.currentDirectoryPath
+        } else {
+            cwd = snapshot.configuration.home
+        }
+
+        let config = ProcessConfiguration(
+            executable: executablePath,
+            arguments: ["-s"],
+            environment: [
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "TERM=xterm-256color",
+            ],
+            workingDirectory: cwd,
+            terminal: true,
+            user: snapshot.configuration.user,
+            supplementalGroups: []
+        )
+        let io = try ProcessIO.create(tty: true, interactive: true, detach: false)
+        defer { try? io.close() }
+        let process = try await ContainerClient().createProcess(
+            containerId: containerId,
+            processId: UUID().uuidString.lowercased(),
+            configuration: config,
+            stdio: io.stdio
+        )
+        return try await io.handleProcess(process: process, log: Backend.log)
     }
 
     static func setDefault(_ id: String) async throws {

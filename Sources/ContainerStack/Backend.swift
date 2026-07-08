@@ -626,17 +626,26 @@ enum TerminalLauncher {
     /// Davit binary in `exec` mode, which attaches a TTY through the XPC API
     /// (see ExecMode in Main.swift).
     static func openShell(containerID: String) {
+        open(title: "container: \(containerID)", command: "exec", id: containerID)
+    }
+
+    /// Login shell into a container machine (davit machine exec over XPC).
+    static func openMachineShell(machineID: String) {
+        open(title: "machine: \(machineID)", command: "machine exec", id: machineID)
+    }
+
+    private static func open(title: String, command: String, id: String) {
         let selfPath = Bundle.main.executablePath ?? CommandLine.arguments[0]
-        let escaped = containerID.replacingOccurrences(of: "'", with: "'\\''")
+        let escaped = id.replacingOccurrences(of: "'", with: "'\\''")
         let script = """
         #!/bin/sh
         clear
-        printf '\\033]0;%s\\007' 'container: \(escaped)'
-        exec '\(selfPath)' exec '\(escaped)'
+        printf '\\033]0;%s\\007' '\(title)'
+        exec '\(selfPath)' \(command) '\(escaped)'
         """
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("Davit", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let url = dir.appendingPathComponent("shell-\(containerID).command")
+        let url = dir.appendingPathComponent("shell-\(id).command")
         try? script.write(to: url, atomically: true, encoding: .utf8)
         try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
         open(commandFile: url, in: TerminalApp.preferred)
