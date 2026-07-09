@@ -58,7 +58,7 @@ remaining A item is #2 (file browsing), intentionally scheduled in Wave 2.
   container_name, environment (both forms), ports (host-ip/proto dropped w/ warning),
   volumes (named/bind/tmpfs, ro), networks, cpus/mem_limit + deploy.resources.limits,
   command, user, working_dir, depends_on (order only). `build:` not yet.
-  Headless: `Davit compose plan|up <file>`; parser covered by a selftest step.
+  Headless: `Davit compose plan|up [-f <file>] [--profile <p>] [service…]`; parser covered by a selftest step.
 - ✅ Image build from a Dockerfile — Images → Build Image: context/Dockerfile
   pickers, tag, build args, no-cache/re-pull toggles; drives the platform's
   BuildKit shim over vsock (auto-starting the builder), exports OCI, loads +

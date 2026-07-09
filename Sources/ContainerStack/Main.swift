@@ -227,8 +227,9 @@ enum Main {
             // plan parses + prints (no side effects); up also creates volumes/networks
             // and starts services. Without -f the file is autodiscovered like docker;
             // naming services selects them plus their depends_on closure.
+            let usage = "usage: compose plan|up [-f <file>] [--profile <name>]... [service...]\n"
             guard args.count >= 3, args[2] == "plan" || args[2] == "up" else {
-                FileHandle.standardError.write(Data("usage: compose plan|up [-f <file>] [--profile <name>]... [service...]\n".utf8)); exit(2)
+                FileHandle.standardError.write(Data(usage.utf8)); exit(2)
             }
             let sub = args[2]
             var file: String?, profiles: [String] = [], serviceNames: [String] = []
@@ -236,15 +237,25 @@ enum Main {
             var i = 3
             while i < args.count {
                 switch args[i] {
-                case "-f", "--file": if i + 1 < args.count { file = (args[i + 1] as NSString).expandingTildeInPath; i += 1 }
-                case "--profile": if i + 1 < args.count { profiles.append(args[i + 1]); i += 1 }
+                case "-f", "--file":
+                    guard i + 1 < args.count else { FileHandle.standardError.write(Data(usage.utf8)); exit(2) }
+                    file = (args[i + 1] as NSString).expandingTildeInPath; i += 1
+                case "--profile":
+                    guard i + 1 < args.count else { FileHandle.standardError.write(Data(usage.utf8)); exit(2) }
+                    profiles.append(args[i + 1]); i += 1
                 default:
+                    guard !args[i].hasPrefix("-") else {
+                        FileHandle.standardError.write(Data("unknown flag: \(args[i])\n\(usage)".utf8)); exit(2)
+                    }
                     // Legacy `compose plan|up <file>`: the first positional is the
-                    // file iff no -f was given, it looks like a path, and it exists.
+                    // file iff no -f was given and it looks like a path; path-like
+                    // but missing is a friendlier error than "no such service".
                     let expanded = (args[i] as NSString).expandingTildeInPath
                     if file == nil, serviceNames.isEmpty, !hasFileFlag,
-                       args[i].contains("/") || args[i].hasSuffix(".yml") || args[i].hasSuffix(".yaml"),
-                       FileManager.default.fileExists(atPath: expanded) {
+                       args[i].contains("/") || args[i].hasSuffix(".yml") || args[i].hasSuffix(".yaml") {
+                        guard FileManager.default.fileExists(atPath: expanded) else {
+                            FileHandle.standardError.write(Data("compose file not found: \(args[i])\n".utf8)); exit(1)
+                        }
                         file = expanded
                     } else {
                         serviceNames.append(args[i])
@@ -252,12 +263,13 @@ enum Main {
                 }
                 i += 1
             }
-            if let env = ProcessInfo.processInfo.environment["COMPOSE_PROFILES"] {
-                profiles += env.split(separator: ",").map(String.init).filter { !$0.isEmpty }
+            // COMPOSE_PROFILES is the fallback when no --profile was given (docker v2).
+            if profiles.isEmpty, let env = ProcessInfo.processInfo.environment["COMPOSE_PROFILES"] {
+                profiles = env.split(separator: ",").map(String.init).filter { !$0.isEmpty }
             }
             let discovered = file == nil ? Compose.discoverFile(startingAt: FileManager.default.currentDirectoryPath) : nil
             guard let path = file ?? discovered?.path else {
-                FileHandle.standardError.write(Data("no compose file found (looked for compose.yaml, compose.yml, docker-compose.yaml, docker-compose.yml in this and parent directories)\n".utf8)); exit(1)
+                FileHandle.standardError.write(Data("no compose file found (looked for compose.yaml, compose.yml, docker-compose.yml, docker-compose.yaml in this and parent directories)\n".utf8)); exit(1)
             }
             let autodiscovered = file == nil
             let discoveryWarning = discovered?.warning
@@ -635,6 +647,32 @@ enum SelfTest {
                   defaulted.warnings.contains(where: { $0.contains("not a duration") })
             else { throw CLIError(command: "selftest", message: "healthcheck defaults wrong: \(String(describing: defaulted.services[0].healthcheck)) \(defaulted.warnings)") }
 
+            // explicit zeros mean "unset" (engine behavior); quoted retries accepted, junk warns
+            let zeroed = try Compose.parse(
+                text: "services: {a: {image: x, healthcheck: {test: echo ok, interval: 0s, timeout: 0s, retries: 0}}}",
+                projectName: "z")
+            guard let zhc = zeroed.services[0].healthcheck,
+                  zhc.interval == 30, zhc.timeout == 30, zhc.retries == 3
+            else { throw CLIError(command: "selftest", message: "zero healthcheck values not defaulted: \(String(describing: zeroed.services[0].healthcheck))") }
+            let quoted = try Compose.parse(
+                text: "services: {a: {image: x, healthcheck: {test: echo ok, retries: \"7\"}}}", projectName: "q")
+            guard quoted.services[0].healthcheck?.retries == 7 else {
+                throw CLIError(command: "selftest", message: "quoted retries wrong: \(String(describing: quoted.services[0].healthcheck))")
+            }
+            let badRetries = try Compose.parse(
+                text: "services: {a: {image: x, healthcheck: {test: echo ok, retries: seven}}}", projectName: "r")
+            guard badRetries.services[0].healthcheck?.retries == 3,
+                  badRetries.warnings.contains(where: { $0.contains("not an integer") })
+            else { throw CLIError(command: "selftest", message: "bad retries not warned: \(badRetries.warnings)") }
+
+            // depends_on "required: false" isn't supported — must warn, not vanish
+            let optional = try Compose.parse(
+                text: "services: {a: {image: x, depends_on: {b: {condition: service_started, required: false}}}, b: {image: y}}",
+                projectName: "o")
+            guard optional.warnings.contains(where: { $0.contains("required: false") }) else {
+                throw CLIError(command: "selftest", message: "required: false not warned: \(optional.warnings)")
+            }
+
             // selection: dependency closure in start order, volumes/networks pruned
             let sel = try plan.selecting(services: ["web"], activeProfiles: [])
             guard sel.services.map(\.service) == ["db", "init", "web"],
@@ -648,6 +686,15 @@ enum SelfTest {
             guard try plan.selecting(services: [], activeProfiles: ["debugging"]).services.count == 5 else {
                 throw CLIError(command: "selftest", message: "--profile debugging should enable debug")
             }
+            // "*" activates every profile (docker v2.24+)
+            guard try plan.selecting(services: [], activeProfiles: ["*"]).services.count == 5 else {
+                throw CLIError(command: "selftest", message: "--profile '*' should enable every profile")
+            }
+            // GUI import path: gated services drop out with a pointer at the CLI
+            let gui = try ComposeImport.parseFiltered(text: yaml, projectName: "ignored", baseDir: nil)
+            guard gui.services.map(\.service) == ["db", "init", "cache", "web"],
+                  gui.warnings.contains(where: { $0.contains("requires profile debugging") })
+            else { throw CLIError(command: "selftest", message: "GUI profile filter wrong: \(gui.services.map(\.service)) \(gui.warnings)") }
             // naming a gated service auto-activates its own profile
             let named = try plan.selecting(services: ["debug"], activeProfiles: [])
             guard named.services.map(\.service) == ["db", "cache", "debug"] else {
@@ -692,11 +739,11 @@ enum SelfTest {
             guard let parent = Compose.discoverFile(startingAt: nested.path, environment: [:]),
                   parent.path == root.appendingPathComponent("docker-compose.yml").path, parent.warning == nil
             else { throw CLIError(command: "selftest", message: "parent docker-compose.yml not discovered") }
-            // candidate order within one directory: docker-compose.yaml beats .yml
+            // candidate order within one directory: docker-compose.yml beats .yaml (docker parity)
             try write("docker-compose.yaml", in: root)
             guard Compose.discoverFile(startingAt: nested.path, environment: [:])?.path
-                == root.appendingPathComponent("docker-compose.yaml").path
-            else { throw CLIError(command: "selftest", message: "docker-compose.yaml should beat docker-compose.yml") }
+                == root.appendingPathComponent("docker-compose.yml").path
+            else { throw CLIError(command: "selftest", message: "docker-compose.yml should beat docker-compose.yaml") }
             // the nearest directory wins over any parent
             try write("compose.yml", in: nested)
             guard Compose.discoverFile(startingAt: nested.path, environment: [:])?.path
@@ -718,15 +765,13 @@ enum SelfTest {
         await step("compose: up with depends_on conditions") {
             let containers = ["davit-selftest-compose-db", "davit-selftest-compose-init",
                               "davit-selftest-compose-web", "davit-selftest-composef-bad",
-                              "davit-selftest-composef-waiter"]
-            for c in containers { try? await ContainerService.delete(c, force: true) }
-            try? await ContainerService.deleteVolume("davit-selftest-composevol")
-            defer {
-                Task {
-                    for c in containers { try? await ContainerService.delete(c, force: true) }
-                    try? await ContainerService.deleteVolume("davit-selftest-composevol")
-                }
+                              "davit-selftest-composef-waiter", "davit-selftest-composex-dead",
+                              "davit-selftest-composex-waiter"]
+            func cleanup() async {
+                for c in containers { try? await ContainerService.delete(c, force: true) }
+                try? await ContainerService.deleteVolume("davit-selftest-composevol")
             }
+            await cleanup()  // leftovers from a previous aborted run
 
             let yaml = """
             name: davit-selftest-compose
@@ -750,52 +795,76 @@ enum SelfTest {
             let plan = try Compose.parse(text: yaml, projectName: "ignored")
             let events = ProgressLog()
             let upTask = Task { try await Compose.up(plan: plan) { events.append($0, $1) } }
-
-            // up blocks on db's healthcheck until /ready exists — create it from
-            // the outside once db is running (the fixture's readiness signal).
-            var dbRunning = false
-            for _ in 0..<120 {
-                if let db = try? await ContainerService.listContainers().first(where: { $0.id == "davit-selftest-compose-db" }),
-                   db.isRunning { dbRunning = true; break }
-                try await Task.sleep(for: .milliseconds(500))
-            }
-            guard dbRunning else {
-                upTask.cancel()
-                throw CLIError(command: "selftest", message: "db never started")
-            }
-            _ = try await ContainerService.exec("davit-selftest-compose-db", ["touch", "/ready"])
-            try await upTask.value
-
-            let web = try await ContainerService.listContainers().first { $0.id == "davit-selftest-compose-web" }
-            guard web?.isRunning == true else { throw CLIError(command: "selftest", message: "web not running after up") }
-            let seen = events.all
-            func index(_ step: Compose.StepKind, _ done: Bool) -> Int? {
-                seen.firstIndex { $0.0 == step && $0.1 == done }
-            }
-            guard let dbHealthy = index(.waiting(service: "db", condition: "service_healthy"), true),
-                  let initDone = index(.waiting(service: "init", condition: "service_completed_successfully"), true),
-                  let webStart = index(.service("web"), false),
-                  dbHealthy < webStart, initDone < webStart
-            else { throw CLIError(command: "selftest", message: "waiting steps missing or out of order: \(seen)") }
-
-            // Failure path: a probe that never succeeds must fail the dependent's up.
-            let failing = try Compose.parse(text: """
-            name: davit-selftest-composef
-            services:
-              bad:
-                image: alpine:latest
-                command: ["sleep", "300"]
-                healthcheck: { test: [CMD, "false"], interval: 1s, retries: 2 }
-              waiter:
-                image: alpine:latest
-                command: ["sleep", "300"]
-                depends_on:
-                  bad: { condition: service_healthy }
-            """, projectName: "ignored")
             do {
-                try await Compose.up(plan: failing) { _, _ in }
-                throw CLIError(command: "selftest", message: "unhealthy dependency did not fail up")
-            } catch Compose.Error.unhealthy(service: "bad", failures: _) { /* expected */ }
+                // up blocks on db's healthcheck until /ready exists — create it from
+                // the outside once db is running (the fixture's readiness signal).
+                var dbRunning = false
+                for _ in 0..<120 {
+                    if let db = try? await ContainerService.listContainers().first(where: { $0.id == "davit-selftest-compose-db" }),
+                       db.isRunning { dbRunning = true; break }
+                    try await Task.sleep(for: .milliseconds(500))
+                }
+                guard dbRunning else { throw CLIError(command: "selftest", message: "db never started") }
+                _ = try await ContainerService.exec("davit-selftest-compose-db", ["touch", "/ready"])
+                try await upTask.value
+
+                let web = try await ContainerService.listContainers().first { $0.id == "davit-selftest-compose-web" }
+                guard web?.isRunning == true else { throw CLIError(command: "selftest", message: "web not running after up") }
+                let seen = events.all
+                func index(_ step: Compose.StepKind, _ done: Bool) -> Int? {
+                    seen.firstIndex { $0.0 == step && $0.1 == done }
+                }
+                guard let dbHealthy = index(.waiting(service: "db", condition: "service_healthy"), true),
+                      let initDone = index(.waiting(service: "init", condition: "service_completed_successfully"), true),
+                      let webStart = index(.service("web"), false),
+                      dbHealthy < webStart, initDone < webStart
+                else { throw CLIError(command: "selftest", message: "waiting steps missing or out of order: \(seen)") }
+
+                // Failure path: a probe that never succeeds must fail the dependent's up.
+                let failing = try Compose.parse(text: """
+                name: davit-selftest-composef
+                services:
+                  bad:
+                    image: alpine:latest
+                    command: ["sleep", "300"]
+                    healthcheck: { test: [CMD, "false"], interval: 1s, retries: 2 }
+                  waiter:
+                    image: alpine:latest
+                    command: ["sleep", "300"]
+                    depends_on:
+                      bad: { condition: service_healthy }
+                """, projectName: "ignored")
+                do {
+                    try await Compose.up(plan: failing) { _, _ in }
+                    throw CLIError(command: "selftest", message: "unhealthy dependency did not fail up")
+                } catch Compose.Error.unhealthy(service: "bad", failures: _) { /* expected */ }
+
+                // Fail fast: a dependency that exits mid-wait must abort the up
+                // immediately, not after retries × interval of dead probes.
+                let exiting = try Compose.parse(text: """
+                name: davit-selftest-composex
+                services:
+                  dead:
+                    image: alpine:latest
+                    command: ["sleep", "2"]
+                    healthcheck: { test: [CMD, "false"], interval: 1s, retries: 30 }
+                  waiter:
+                    image: alpine:latest
+                    command: ["sleep", "300"]
+                    depends_on:
+                      dead: { condition: service_healthy }
+                """, projectName: "ignored")
+                do {
+                    try await Compose.up(plan: exiting) { _, _ in }
+                    throw CLIError(command: "selftest", message: "exited dependency did not fail up")
+                } catch Compose.Error.dependencyExited(service: "dead") { /* expected */ }
+            } catch {
+                upTask.cancel()
+                _ = try? await upTask.value
+                await cleanup()
+                throw error
+            }
+            await cleanup()
         }
         await step("registry: list + reject bad credentials") {
             _ = RegistryService.listLogins()  // must not throw

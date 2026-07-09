@@ -45,19 +45,21 @@ minimal style (manual arg loops, warnings list, Error enum, sequential up).
 ## Design decisions (docker-compose parity semantics)
 
 1. **Autodiscovery** (when no `-f`/positional file): try, in order, `compose.yaml`,
-   `compose.yml`, `docker-compose.yaml`, `docker-compose.yml` in cwd, then walk parent
+   `compose.yml`, `docker-compose.yml`, `docker-compose.yaml` in cwd, then walk parent
    directories (docker behavior). `COMPOSE_FILE` env (single path) takes precedence.
    Warn when both `compose.yaml` and `compose.yml` exist in the winning directory.
    Project name = winning file's directory basename (unchanged convention).
 2. **CLI syntax** (backward compatible):
    `Davit compose plan|up [-f|--file <path>] [--profile <name>]... [service...]`.
    A positional arg counts as the file (old syntax) iff no `-f` given AND it looks like
-   a path (contains `/` or ends in `.yml`/`.yaml`) AND exists; otherwise it's a service
-   name. Unknown service → error `no such service: X` (exit 1). Usage → exit 2.
+   a path (contains `/` or ends in `.yml`/`.yaml`); path-like but missing → error
+   `compose file not found: X` (exit 1). Otherwise it's a service name; unknown service
+   → error `no such service: X` (exit 1). Usage (incl. flag typos) → exit 2.
 3. **Service selection:** selected = named services + transitive `depends_on` closure,
    kept in topo order; created volumes/networks pruned to those the selected services
    reference. Applies to both `plan` and `up`, and is available to the GUI as API.
-4. **Profiles:** active set = repeated `--profile` ∪ comma-separated `COMPOSE_PROFILES`.
+4. **Profiles:** active set = repeated `--profile`; comma-separated `COMPOSE_PROFILES`
+   is the fallback when no flags are given (docker v2). `"*"` activates every profile.
    Services without `profiles:` are always enabled. Explicitly-named CLI services
    auto-activate their own profiles (docker v2). A dependency pulled in by closure that
    remains profile-disabled → error naming the missing profile (close to docker; we
@@ -144,7 +146,7 @@ follow-up; do not creep.
   selftest OK + verifier runs a real `plan`-mode round-trip from a temp dir (no `-f`,
   autodiscovered; with service selection + `--profile`) asserting output. Commit:
   `compose: CLI autodiscovery, service selection, profiles`.
-- [ ] **E5 — Review + wrap.** Code-review agent over the E1–E4 diff (correctness,
+- [x] **E5 — Review + wrap.** Code-review agent over the E1–E4 diff (correctness,
   docker-semantics fidelity, style match); fix findings; final full build + selftest +
   headless plan round-trip evidence. Commit: `compose: review fixes` (or fold).
 

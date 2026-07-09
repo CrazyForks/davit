@@ -88,7 +88,7 @@ struct ContainersView: View {
                 let url = URL(fileURLWithPath: args[i + 1])
                 if let text = try? String(contentsOf: url, encoding: .utf8) {
                     let dir = url.deletingLastPathComponent()
-                    composePlan = try? Compose.parse(
+                    composePlan = try? ComposeImport.parseFiltered(
                         text: text, projectName: dir.lastPathComponent, baseDir: dir.path)
                     try? await Task.sleep(for: .seconds(1))
                     FileHandle.standardError.write(Data("POSED compose\n".utf8))

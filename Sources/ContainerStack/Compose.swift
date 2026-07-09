@@ -30,6 +30,24 @@ enum Compose {
             argv += commandArgs
             return argv.map(Compose.shellQuote).joined(separator: " ")
         }
+
+        /// Paired `--network` values — the networks this service attaches to.
+        var networkRefs: [String] { paired("--network") }
+
+        /// Named-volume sources of `--mount type=volume,…` specs.
+        var volumeRefs: [String] {
+            paired("--mount").compactMap { spec in
+                guard spec.hasPrefix("type=volume,") else { return nil }
+                return spec.split(separator: ",").first { $0.hasPrefix("source=") }
+                    .map { String($0.dropFirst("source=".count)) }
+            }
+        }
+
+        private func paired(_ flag: String) -> [String] {
+            managementArgs.indices.compactMap { i in
+                managementArgs[i] == flag && i + 1 < managementArgs.count ? managementArgs[i + 1] : nil
+            }
+        }
     }
 
     struct Plan: Identifiable {
@@ -70,6 +88,7 @@ enum Compose {
         case noSuchService(String)
         case inactiveProfile(service: String, profile: String)
         case unhealthy(service: String, failures: Int)
+        case dependencyExited(service: String)
         case didNotComplete(service: String, exitCode: Int32?)
 
         var errorDescription: String? {
@@ -83,6 +102,7 @@ enum Compose {
             case .noSuchService(let s): return "no such service: \(s)"
             case .inactiveProfile(let s, let p): return "service \"\(s)\" requires profile \"\(p)\" — activate it with --profile \(p)"
             case .unhealthy(let s, let n): return "service \"\(s)\" is unhealthy after \(n) failed probes"
+            case .dependencyExited(let s): return "service \"\(s)\" exited before becoming healthy"
             case .didNotComplete(let s, let code):
                 return code.map { "service \"\(s)\" didn't complete successfully: exit \($0)" }
                     ?? "service \"\(s)\" wasn't started by this compose up, so its exit code is unknown"
@@ -109,7 +129,7 @@ enum Compose {
                 : URL(fileURLWithPath: dir).appendingPathComponent(expanded).standardizedFileURL.path
             return (path, nil)
         }
-        let candidates = ["compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"]
+        let candidates = ["compose.yaml", "compose.yml", "docker-compose.yml", "docker-compose.yaml"]
         var url = URL(fileURLWithPath: dir).standardizedFileURL
         while true {
             let present = candidates.filter { FileManager.default.fileExists(atPath: url.appendingPathComponent($0).path) }
@@ -306,11 +326,16 @@ enum Compose {
         case let map as [String: Any]:
             for (dep, spec) in map.sorted(by: { $0.key < $1.key }) {
                 var condition = DependsCondition.started
-                if let m = spec as? [String: Any], let raw = m["condition"] as? String {
-                    if let parsed = DependsCondition(rawValue: raw) {
-                        condition = parsed
-                    } else {
-                        warnings.append("\(key): depends_on \(dep) condition \"\(raw)\" is unknown — treating as service_started")
+                if let m = spec as? [String: Any] {
+                    if let raw = m["condition"] as? String {
+                        if let parsed = DependsCondition(rawValue: raw) {
+                            condition = parsed
+                        } else {
+                            warnings.append("\(key): depends_on \(dep) condition \"\(raw)\" is unknown — treating as service_started")
+                        }
+                    }
+                    if (m["required"] as? Bool) == false {
+                        warnings.append("\(key): depends_on \(dep) \"required: false\" is not supported — dependency treated as required")
                     }
                 }
                 deps[dep] = condition
@@ -384,11 +409,23 @@ enum Compose {
             warnings.append("\(key): healthcheck \(field) \"\(scalarString(raw))\" is not a duration — using default")
             return def
         }
+        var retries = 3
+        if let raw = hc["retries"] {
+            if let n = (raw as? Int) ?? Int(scalarString(raw)) {
+                retries = n
+            } else {
+                warnings.append("\(key): healthcheck retries \"\(scalarString(raw))\" is not an integer — using default")
+            }
+        }
+        // The engine treats zero interval/timeout/retries as "unset" — same here,
+        // so an explicit `interval: 0s` can't turn the prober into a hot loop.
+        let interval = duration("interval", default: 30)
+        let timeout = duration("timeout", default: 30)
         return Healthcheck(
             test: test, shellForm: shellForm,
-            interval: duration("interval", default: 30),
-            timeout: duration("timeout", default: 30),
-            retries: (hc["retries"] as? Int) ?? 3,
+            interval: interval > 0 ? interval : 30,
+            timeout: timeout > 0 ? timeout : 30,
+            retries: retries > 0 ? retries : 3,
             startPeriod: duration("start_period", default: 0))
     }
 
@@ -489,10 +526,11 @@ enum Compose {
 extension Compose.Plan {
     /// Docker-style service selection: the named services plus their transitive
     /// depends_on closure, kept in start order. Profiles filter first (a service
-    /// without profiles is always enabled); naming a service explicitly activates
-    /// its own profiles (docker v2), but a dependency pulled in by closure whose
-    /// profiles all stay inactive is an error. Created volumes/networks are pruned
-    /// to what the selected services reference. Empty `services` = every enabled one.
+    /// without profiles is always enabled; profile `"*"` activates every one);
+    /// naming a service explicitly activates its own profiles (docker v2), but a
+    /// dependency pulled in by closure whose profiles all stay inactive is an
+    /// error. Created volumes/networks are pruned to what the selected services
+    /// reference. Empty `services` = every enabled one.
     func selecting(services requested: [String], activeProfiles: [String]) throws -> Compose.Plan {
         let byName = Dictionary(uniqueKeysWithValues: services.map { ($0.service, $0) })
         for name in requested where byName[name] == nil {
@@ -501,7 +539,7 @@ extension Compose.Plan {
         var active = Set(activeProfiles)
         for name in requested { active.formUnion(byName[name]?.profiles ?? []) }
         func enabled(_ svc: Compose.ServicePlan) -> Bool {
-            svc.profiles.isEmpty || svc.profiles.contains(where: active.contains)
+            svc.profiles.isEmpty || active.contains("*") || svc.profiles.contains(where: active.contains)
         }
 
         var selected = Set<String>()
@@ -516,20 +554,8 @@ extension Compose.Plan {
         }
 
         let kept = services.filter { selected.contains($0.service) }
-        var volumeRefs = Set<String>()
-        var networkRefs = Set<String>()
-        for svc in kept {
-            for i in svc.managementArgs.indices where i + 1 < svc.managementArgs.count {
-                let value = svc.managementArgs[i + 1]
-                if svc.managementArgs[i] == "--mount", value.hasPrefix("type=volume,") {
-                    for part in value.split(separator: ",") where part.hasPrefix("source=") {
-                        volumeRefs.insert(String(part.dropFirst("source=".count)))
-                    }
-                } else if svc.managementArgs[i] == "--network" {
-                    networkRefs.insert(value)
-                }
-            }
-        }
+        let volumeRefs = Set(kept.flatMap(\.volumeRefs))
+        let networkRefs = Set(kept.flatMap(\.networkRefs))
         return Compose.Plan(
             project: project,
             volumes: volumes.filter(volumeRefs.contains),
@@ -552,12 +578,15 @@ actor ComposeExitCodes {
     private var order: [String] = []  // registration order, for eviction
 
     /// Watches the process until it exits. Entries are capped (oldest dropped)
-    /// so a long-lived GUI session doesn't accumulate handles.
+    /// and displaced tasks are cancelled — best effort only: the underlying XPC
+    /// wait ignores cancellation, so a cancelled task still lives until its
+    /// process exits; it just stops being tracked here.
     func register(id: String, process: ClientProcess) {
+        waits[id]?.cancel()
         waits[id] = Task { try? await process.wait() }
         order.removeAll { $0 == id }
         order.append(id)
-        if order.count > 64 { waits[order.removeFirst()] = nil }
+        if order.count > 64 { waits.removeValue(forKey: order.removeFirst())?.cancel() }
     }
 
     /// Blocks until the process exits. nil when the id was never registered
@@ -610,12 +639,7 @@ extension Compose {
             await progress(.network(network), true)
         }
         // Undeclared networks referenced by services (we warned) — create those too.
-        let referenced = Set(plan.services.flatMap { svc in
-            svc.managementArgs.indices.compactMap { i in
-                svc.managementArgs[i] == "--network" && i + 1 < svc.managementArgs.count
-                    ? svc.managementArgs[i + 1] : nil
-            }
-        })
+        let referenced = Set(plan.services.flatMap(\.networkRefs))
         for network in referenced.subtracting(plan.networks).subtracting(existingNetworks).sorted() {
             await progress(.network(network), false)
             try await ContainerService.createNetwork(name: network, subnet: nil, internal: false)
@@ -667,7 +691,8 @@ extension Compose {
     /// Probes `container` with its healthcheck until healthy — the first exit-0
     /// probe, even inside start_period — or unhealthy after `retries` consecutive
     /// countable failures (failures before start_period has elapsed don't count).
-    /// Bounded by start_period + retries × (interval + timeout).
+    /// Fails fast when the container stops (docker parity: no point probing a
+    /// dead dependency). Bounded by start_period + retries × (interval + timeout).
     static func waitHealthy(service: String, container: String, healthcheck hc: Healthcheck) async throws {
         let started = ContinuousClock.now
         var failures = 0
@@ -677,6 +702,10 @@ extension Compose {
             // (see ContainerService.ExecTimeout), so it's abandoned, not killed.
             let result = try? await ContainerService.exec(container, hc.argv, timeout: .seconds(hc.timeout))
             if result?.exitCode == 0 { return }
+            if let records = try? await ContainerService.listContainers(),
+               records.first(where: { $0.id == container })?.isRunning != true {
+                throw Error.dependencyExited(service: service)
+            }
             if started.duration(to: .now) >= .seconds(hc.startPeriod) {
                 failures += 1
                 if failures >= hc.retries { throw Error.unhealthy(service: service, failures: failures) }
