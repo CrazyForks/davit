@@ -93,7 +93,7 @@ level to .debug for the process unless DAVIT_LOG_LEVEL was explicitly set.
   from a .env value, env_file: values now interpolated (update its selftest + stale
   comment). Done when: build + full selftest OK. Commit:
   `compose: interpolate .env and env_file values at load (docker parity)`.
-- [ ] **I2 — default-memory docs.** Per Design I2, README only. Done when: build OK
+- [x] **I2 — default-memory docs.** Per Design I2, README only. Done when: build OK
   (no code change) + README renders sensibly. Commit:
   `compose: document platform default memory/cpus for services without limits`.
 - [ ] **I3 — --down-on-failure.** Per Design I3. Live selftest: fixture svc a
