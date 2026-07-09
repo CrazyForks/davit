@@ -132,6 +132,56 @@ follow-up tasks F1/F2 below on user request, 2026-07-09.)
    for free. Reuse of a same-named container that was never compose-created is
    accepted (indistinguishable without labels; mirrors docker's container_name rules).
 
+## G-round: lifecycle subcommands + remaining file keys (2026-07-09, user request)
+
+12. **Shared CLI plumbing:** one arg-parse helper for all compose subcommands:
+   `compose <sub> [-f <file>] [--env-file <path>] [--profile <name>]... [flags] [service...]`
+   with the existing file-vs-service positional rules, autodiscovery, env handling.
+   Subcommands after this round: `plan`, `up [-d|--detach]`, `down [-v|--volumes]`,
+   `ps`, `logs [-f|--follow] [--tail <n>]`, `stop`, `start`, `restart`, `pull`,
+   `exec <service> <command...>`. Usage exit 2; runtime errors exit 1.
+13. **down:** selection = named services, else ALL services in the file with every
+   profile active (teardown must not strand profile-gated containers — deliberate,
+   documented divergence from docker's active-profile filtering). Reverse-topo order:
+   stop each existing container with `ContainerStopOptions` honoring new
+   `stop_grace_period` (duration parser) and `stop_signal` keys, then force-delete.
+   Missing containers skip silently (idempotent). Only a FULL project down (no service
+   args) also deletes declared non-external networks (tolerate in-use → warning) and,
+   with `-v/--volumes`, declared non-external volumes. Progress prints
+   `down: service db done` style lines. No `--remove-orphans`: identity is name-based,
+   orphans are undetectable without labels — documented limitation.
+14. **ps:** parse + selection, then list existing project containers (running or not)
+   as aligned columns SERVICE / CONTAINER / STATE / PORTS from the live records;
+   never-created services omitted (docker parity); exit 0 regardless.
+15. **logs + up attach:** `logs [service...]`: for each existing project container,
+   read the daemon log FileHandles (`ContainerClient().logs(id:)`, index 0 = stdout
+   log — the LogStreamer tail logic is the reference); print lines prefixed
+   `<container>  | ` (aligned); `--tail <n>` limits initial backlog (default: all);
+   `-f/--follow` installs readability handlers and blocks until Ctrl-C (containers
+   unaffected). `up` gains `-d/--detach`; WITHOUT it, after a successful up, attach to
+   the selected services' logs in follow mode (print an "attaching — Ctrl-C detaches,
+   containers keep running" line first; docker-compose behavior approximation).
+16. **stop/start/restart/pull:** thin subcommands over the selection: stop = reverse-
+   topo `ContainerService.stop` with grace/signal options; start = topo
+   `ContainerService.start` on existing containers; restart = stop then start;
+   pull = `ContainerService.pullImage` per selected service image with progress lines.
+17. **exec:** `compose exec <service> <command...>` resolves the service's container
+   name (must exist & be running → clear errors), then reuses the existing interactive
+   exec path (Main.swift ExecMode) with the given argv — check whether ExecMode
+   supports argv; extend minimally if it only opens a shell.
+18. **Remaining file keys:** `env_file:` (string / list / `{path, required}` map;
+   paths relative to compose dir; loaded with the existing dotenv parser; NO
+   interpolation of file contents (docker parity); precedence: `environment:` >
+   `env_file:` entries, later files > earlier); `entrypoint:` (string → `--entrypoint`;
+   list → first element as `--entrypoint`, remainder PREPENDED to the command argv —
+   documented approximation of Apple's single-string entrypoint; empty → warning).
+   `restart:` stays warn-only (no daemon-side policy exists — platform limit).
+   Explicitly NOT in this round, with reasons: `scale`/`deploy.replicas` (numbered
+   containers ripple through naming/reuse/ps/logs — own round), `--remove-orphans`
+   (no labels), `config` (`plan` covers it), `run`/`cp`/`top`/`events`/`port`/
+   `images`/`ls`/`watch`/`kill`/`rm` (niche; `down`/`stop` cover teardown), `push`,
+   `build` (user: not important).
+
 ## Tasks
 
 - [x] **F1 — Host-IP port binding.** Implement decision 10 in Compose.swift ports
@@ -157,6 +207,30 @@ follow-up tasks F1/F2 below on user request, 2026-07-09.)
   stopped name-colliding container before a fresh up → recreated cleanly. defer
   cleanup. Done when: build + full selftest OK. Commit:
   `compose: idempotent up (reuse running, recreate stopped)`.
+- [ ] **G1 — CLI refactor + down + ps.** Decisions 12/13/14 (+ parse
+  `stop_grace_period`/`stop_signal` keys used by down). Pure selftest: new-key parsing.
+  Live selftest: up 2-service fixture w/ declared network+volume → ps lists both
+  running → down (no args) removes containers + declared network, volume KEPT →
+  second down idempotent → up again → down -v removes volume; service-scoped down
+  removes only that container and no networks/volumes. Done when: build + full
+  selftest OK + CLI round-trip. Commit: `compose: down + ps subcommands`.
+- [ ] **G2 — logs + up attach.** Decision 15. Live selftest: fixture printing known
+  lines → `logs --tail` output contains prefixed lines (non-follow path); follow mode
+  verified by the verifier manually with a timeout. up -d returns immediately (existing
+  behavior); non-detached attach is verifier-tested manually. Done when: build + full
+  selftest OK + CLI round-trip evidence. Commit: `compose: logs + up log attach`.
+- [ ] **G3 — stop/start/restart/pull.** Decision 16. Live selftest: up → stop svc →
+  ps shows stopped → start → running → restart → running; pull alpine:latest prints
+  progress and exits 0. Done when: build + full selftest OK. Commit:
+  `compose: stop/start/restart/pull subcommands`.
+- [ ] **G4 — exec + file keys.** Decisions 17/18 (env_file, entrypoint, exec).
+  Pure selftest: env_file forms + precedence, entrypoint string/list mapping.
+  Live: exec round-trip (`compose exec db /bin/echo hi` prints hi, exit 0; non-running
+  service → clear error). Done when: build + full selftest OK. Commit:
+  `compose: exec subcommand, env_file + entrypoint keys`.
+- [ ] **G5 — Review + wrap.** Two-lens review (correctness+concurrency; docker
+  parity+UX) over the G-round diff, adversarial verify, fix; README + usage strings
+  final; full suite + CLI round-trips. Commit: `compose: G-round review fixes + docs`.
 
 - [x] **E1 — Parse layer (Compose.swift + selftest).** ServicePlan gains `profiles:
   [String]`, `healthcheck: Healthcheck?`, `dependsOn: [String: DependsCondition]`
