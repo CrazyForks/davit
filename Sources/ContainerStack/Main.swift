@@ -534,7 +534,7 @@ enum SelfTest {
             services:
               web:
                 image: nginx:latest
-                ports: ["8081:80", "127.0.0.1:9090:90/udp"]
+                ports: ["8081:80", "127.0.0.1:9090:90/udp", "[::1]:7443:443", {target: 81, published: 8082, host_ip: 10.0.0.5}]
                 environment: [MODE=x]
                 depends_on: [db]
                 volumes: [data:/var/lib/web, ./local:/mnt/here:ro]
@@ -567,14 +567,17 @@ enum SelfTest {
                 throw CLIError(command: "selftest", message: "command split wrong: \(db.commandArgs)")
             }
             guard web.managementArgs.contains("8081:80"),
-                  web.managementArgs.contains("9090:90"),
+                  web.managementArgs.contains("127.0.0.1:9090:90"),
+                  web.managementArgs.contains("[::1]:7443:443"),
+                  web.managementArgs.contains("10.0.0.5:8082:81"),
                   web.managementArgs.contains("type=volume,source=data,target=/var/lib/web"),
                   web.managementArgs.contains("type=bind,source=/base/local,target=/mnt/here,readonly")
             else { throw CLIError(command: "selftest", message: "web management wrong: \(web.managementArgs)") }
             guard plan.volumes == ["data"] else { throw CLIError(command: "selftest", message: "volumes wrong: \(plan.volumes)") }
             guard plan.warnings.contains(where: { $0.contains("restart") }),
-                  plan.warnings.contains(where: { $0.contains("only tcp") })
-            else { throw CLIError(command: "selftest", message: "expected warnings missing: \(plan.warnings)") }
+                  plan.warnings.contains(where: { $0.contains("only tcp") }),
+                  !plan.warnings.contains(where: { $0.contains("host IP") })
+            else { throw CLIError(command: "selftest", message: "warnings wrong: \(plan.warnings)") }
 
             do {
                 _ = try Compose.parse(text: "services: {a: {image: x, depends_on: [b]}, b: {image: y, depends_on: [a]}}", projectName: "c")

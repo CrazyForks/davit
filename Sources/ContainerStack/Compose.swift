@@ -238,14 +238,15 @@ enum Compose {
                 let parts = spec.split(separator: ":").map(String.init)
                 switch parts.count {
                 case 2: management += ["--publish", "\(parts[0]):\(parts[1])"]
-                case 3: management += ["--publish", "\(parts[1]):\(parts[2])"]  // host-ip dropped
+                case 3...: management += ["--publish", spec]  // IP:host:container — the IP may itself contain colons ("[::1]"), pass through verbatim
                 default: warnings.append("\(key): port \"\(s)\" — container-only ports need an explicit host port; ignored")
                 }
-                if parts.count == 3 { warnings.append("\(key): port \(s) — host IP binding not supported, publishing on all interfaces") }
             } else if let m = port as? [String: Any],
                       let target = m["target"] {
                 if let published = m["published"] {
-                    management += ["--publish", "\(scalarString(published)):\(scalarString(target))"]
+                    var spec = "\(scalarString(published)):\(scalarString(target))"
+                    if let ip = m["host_ip"] { spec = "\(scalarString(ip)):\(spec)" }
+                    management += ["--publish", spec]
                 } else {
                     warnings.append("\(key): port target \(scalarString(target)) has no published port — ignored")
                 }

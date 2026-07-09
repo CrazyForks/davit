@@ -118,7 +118,7 @@ follow-up tasks F1/F2 below on user request, 2026-07-09.)
 
 ## Tasks
 
-- [ ] **F1 — Host-IP port binding.** Implement decision 10 in Compose.swift ports
+- [x] **F1 — Host-IP port binding.** Implement decision 10 in Compose.swift ports
   parsing (short 3-part + long-form `host_ip`); update the pure selftest assertions
   that currently expect the host IP to be dropped (Main.swift compose parse step) to
   expect passthrough. Done when: build + full selftest OK. Commit:
