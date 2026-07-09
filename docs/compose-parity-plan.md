@@ -249,7 +249,7 @@ follow-up tasks F1/F2 below on user request, 2026-07-09.)
   verified by the verifier manually with a timeout. up -d returns immediately (existing
   behavior); non-detached attach is verifier-tested manually. Done when: build + full
   selftest OK + CLI round-trip evidence. Commit: `compose: logs + up log attach`.
-- [ ] **G3 — stop/start/restart/pull.** Decision 16. Live selftest: up → stop svc →
+- [x] **G3 — stop/start/restart/pull.** Decision 16. Live selftest: up → stop svc →
   ps shows stopped → start → running → restart → running; pull alpine:latest prints
   progress and exits 0. Done when: build + full selftest OK. Commit:
   `compose: stop/start/restart/pull subcommands`.

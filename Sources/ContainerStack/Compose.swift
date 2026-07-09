@@ -1,5 +1,6 @@
 import ContainerAPIClient
 import Foundation
+import TerminalProgress
 import Yams
 
 /// Docker Compose import: parse a compose file into a concrete creation plan —
@@ -922,12 +923,7 @@ extension Compose {
         for svc in plan.services.reversed() where selected.contains(svc.service) {
             guard let running = existing[svc.name] else { continue }  // never created
             await progress(.service(svc.service), false)
-            if running {
-                // Unset grace = the platform's stop default (5s, SIGTERM),
-                // same as the app's Stop button. Clamped: a day is plenty.
-                let grace = Int32(min(svc.stopGracePeriod ?? 5, 86_400).rounded())
-                try await ContainerService.stop(svc.name, timeoutSeconds: grace, signal: svc.stopSignal)
-            }
+            if running { try await stopContainer(svc) }
             try await ContainerService.delete(svc.name, force: true)
             await progress(.service(svc.service), true)
         }
@@ -959,6 +955,131 @@ extension Compose {
             }
         }
         return warnings
+    }
+
+    /// stop_grace_period / stop_signal → the platform stop call. Unset grace =
+    /// the platform's stop default (5s, SIGTERM), same as the app's Stop
+    /// button. Clamped: a day is plenty. Shared by down, stop and restart.
+    private static func stopContainer(_ svc: ServicePlan) async throws {
+        let grace = Int32(min(svc.stopGracePeriod ?? 5, 86_400).rounded())
+        try await ContainerService.stop(svc.name, timeoutSeconds: grace, signal: svc.stopSignal)
+    }
+
+    /// Stop the plan's existing containers in reverse dependency order with
+    /// the same grace/signal handling as down, but keep them around for a
+    /// later start. Never-created services skip silently and already-stopped
+    /// containers still report their step (the desired state holds), so stop
+    /// is idempotent like docker's.
+    static func stop(
+        plan: Plan,
+        progress: @escaping @Sendable (StepKind, _ done: Bool) async -> Void
+    ) async throws {
+        let existing = Dictionary(uniqueKeysWithValues:
+            try await ContainerService.listContainers().map { ($0.id, $0.isRunning) })
+        for svc in plan.services.reversed() {
+            guard let running = existing[svc.name] else { continue }  // never created
+            await progress(.service(svc.service), false)
+            if running { try await stopContainer(svc) }
+            await progress(.service(svc.service), true)
+        }
+    }
+
+    /// Start the plan's existing containers in dependency order. Fire-and-
+    /// forget like docker's start: no healthcheck or completion waits — up is
+    /// the command that honors depends_on conditions. A service that was
+    /// never created is a warning (start never creates, that's up's job);
+    /// already-running containers are left alone. Returns the warnings.
+    static func start(
+        plan: Plan,
+        progress: @escaping @Sendable (StepKind, _ done: Bool) async -> Void
+    ) async throws -> [String] {
+        var warnings: [String] = []
+        let existing = Set(try await ContainerService.listContainers().map(\.id))
+        for svc in plan.services {
+            guard existing.contains(svc.name) else {
+                warnings.append("service \(svc.service) has no container — run up")
+                continue
+            }
+            await progress(.service(svc.service), false)
+            try await ContainerService.start(svc.name)
+            await progress(.service(svc.service), true)
+        }
+        return warnings
+    }
+
+    /// stop then start, each per its own rules. The stop pass runs silent so
+    /// every service reports exactly one step pair — read as "restarted" —
+    /// once it is running again.
+    static func restart(
+        plan: Plan,
+        progress: @escaping @Sendable (StepKind, _ done: Bool) async -> Void
+    ) async throws -> [String] {
+        try await stop(plan: plan) { _, _ in }
+        return try await start(plan: plan, progress: progress)
+    }
+
+    /// Pull each plan service's image, one after the other, writing a
+    /// `pull: <image>` header plus coarse progress lines. A cached image is
+    /// silent between header and done — the daemon streams nothing for it.
+    static func pull(
+        plan: Plan,
+        progress: @escaping @Sendable (StepKind, _ done: Bool) async -> Void,
+        output: @escaping @Sendable (String) -> Void = { print($0, terminator: "") }
+    ) async throws {
+        for svc in plan.services {
+            await progress(.service(svc.service), false)
+            output("pull: \(svc.image)\n")
+            let tracker = PullTracker()
+            try await ContainerService.pullImage(svc.image) { events in
+                for line in tracker.consume(events) { output("  \(line)\n") }
+            }
+            await progress(.service(svc.service), true)
+        }
+    }
+
+    /// Reduces a pull's progress event stream to coarse text lines: stage
+    /// descriptions deduplicated (like PullProgressModel — though the image
+    /// pull route only ever streams counters, see the adapter in the client
+    /// library), byte counters folded into at most one line per completed
+    /// decile, or one per 32 MiB while the total is still unknown.
+    private final class PullTracker: @unchecked Sendable {
+        private let lock = NSLock()
+        private var description = ""
+        private var completed: Int64 = 0
+        private var total: Int64 = 0
+        private var lastBucket = 0
+
+        func consume(_ events: [ProgressUpdateEvent]) -> [String] {
+            lock.lock(); defer { lock.unlock() }
+            var lines: [String] = []
+            for event in events {
+                switch event {
+                case .setDescription(let text):
+                    if !text.isEmpty, text != description {
+                        description = text
+                        lines.append(text)
+                    }
+                case .addSize(let n): completed += n
+                case .addTotalSize(let n): total += n
+                default: break
+                }
+            }
+            let mb = Double(completed) / 1_048_576
+            let bucket = total > 0 ? Int(Double(completed) / Double(total) * 10) : Int(mb / 32)
+            if bucket > lastBucket, completed > 0 {
+                lastBucket = bucket
+                if total >= 1_048_576 {
+                    lines.append(String(format: "downloaded %d%% (%.1f of %.1f MB)", min(bucket, 10) * 10, mb, Double(total) / 1_048_576))
+                } else if total > 0 {
+                    // Sub-MB totals happen when most blobs already sit in the
+                    // content store — the percentage is the honest part.
+                    lines.append("downloaded \(min(bucket, 10) * 10)%")
+                } else {
+                    lines.append(String(format: "downloaded %.1f MB", mb))
+                }
+            }
+            return lines
+        }
     }
 
     /// Printable `compose ps` row — the CLI aligns these into columns.

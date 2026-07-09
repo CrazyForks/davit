@@ -336,7 +336,9 @@ enum ComposeCLI {
 
     /// Implemented subcommands; the remaining decision-12 ones land in later
     /// rounds by adding their name here and a case in run().
-    private static let subcommands: Set<String> = ["plan", "up", "down", "ps", "logs"]
+    private static let subcommands: Set<String> = [
+        "plan", "up", "down", "ps", "logs", "stop", "start", "restart", "pull",
+    ]
 
     /// Per-subcommand flags, token → canonical name. These shadow the shared
     /// flags: for `logs`, -f means --follow, so its file flag is `--file` only.
@@ -463,6 +465,21 @@ enum ComposeCLI {
                     try await Compose.logs(
                         plan: parsed, services: inv.services,
                         tail: inv.counts["tail"], follow: inv.flags.contains("follow"))
+                case "stop", "start", "restart", "pull":
+                    let plan = try parsed.selecting(services: inv.services, activeProfiles: inv.profiles)
+                    let sub = inv.subcommand
+                    let report: @Sendable (Compose.StepKind, Bool) async -> Void = { step, done in
+                        if done { print("\(sub): \(step.label) done") }
+                    }
+                    var warnings: [String] = []
+                    switch sub {
+                    case "stop": try await Compose.stop(plan: plan, progress: report)
+                    case "start": warnings = try await Compose.start(plan: plan, progress: report)
+                    case "restart": warnings = try await Compose.restart(plan: plan, progress: report)
+                    default: try await Compose.pull(plan: plan, progress: report)
+                    }
+                    for w in warnings { print("warning: \(w)") }
+                    print("compose \(sub): ok")
                 case "ps":
                     let plan = try parsed.selecting(services: inv.services, activeProfiles: inv.profiles)
                     let records = try await Compose.ps(plan: plan)
@@ -1312,6 +1329,92 @@ enum SelfTest {
                     _ = try await capture(services: ["nope"])
                     throw CLIError(command: "selftest", message: "logs with unknown service not rejected")
                 } catch Compose.Error.noSuchService("nope") { /* expected */ }
+            } catch {
+                await cleanup()
+                throw error
+            }
+            await cleanup()
+        }
+        await step("compose: stop/start/restart + pull") {
+            let names = ["davit-selftest-life-one", "davit-selftest-life-two"]
+            func cleanup() async {
+                for n in names { try? await ContainerService.delete(n, force: true) }
+            }
+            await cleanup()  // leftovers from a previous aborted run
+
+            let plan = try Compose.parse(text: """
+            name: davit-selftest-life
+            services:
+              one:
+                image: alpine:latest
+                command: ["sleep", "300"]
+              two:
+                image: alpine:latest
+                command: ["sleep", "300"]
+                depends_on: [one]
+            """, projectName: "ignored")
+            func running(_ name: String) async throws -> Bool? {
+                try await ContainerService.listContainers().first { $0.id == name }?.isRunning
+            }
+            do {
+                try await Compose.up(plan: plan) { _, _ in }
+
+                // stop: reverse dependency order; containers stay, ps shows stopped
+                let stopEvents = ProgressLog()
+                try await Compose.stop(plan: plan) { stopEvents.append($0, $1) }
+                let stopSeen = stopEvents.all
+                guard let twoStopped = stopSeen.firstIndex(where: { $0.0 == .service("two") && $0.1 }),
+                      let oneStopped = stopSeen.firstIndex(where: { $0.0 == .service("one") && $0.1 }),
+                      twoStopped < oneStopped
+                else { throw CLIError(command: "selftest", message: "stop order wrong: \(stopSeen)") }
+                let stopped = try await Compose.ps(plan: plan)
+                guard stopped.map(\.service) == ["one", "two"], stopped.allSatisfy({ $0.state == "stopped" })
+                else { throw CLIError(command: "selftest", message: "ps after stop wrong: \(stopped)") }
+
+                // second stop: idempotent no-op on already-stopped containers
+                try await Compose.stop(plan: plan) { _, _ in }
+
+                // start: dependency order, no healthcheck waits, both running again
+                let startEvents = ProgressLog()
+                let startWarnings = try await Compose.start(plan: plan) { startEvents.append($0, $1) }
+                let startSeen = startEvents.all
+                guard startWarnings.isEmpty,
+                      let oneStarted = startSeen.firstIndex(where: { $0.0 == .service("one") && $0.1 }),
+                      let twoStarted = startSeen.firstIndex(where: { $0.0 == .service("two") && $0.1 }),
+                      oneStarted < twoStarted
+                else { throw CLIError(command: "selftest", message: "start order/warnings wrong: \(startSeen) \(startWarnings)") }
+                guard try await running(names[0]) == true, try await running(names[1]) == true else {
+                    throw CLIError(command: "selftest", message: "containers not running after start")
+                }
+
+                // restart: exactly one step pair per service, both running after
+                let restartEvents = ProgressLog()
+                let restartWarnings = try await Compose.restart(plan: plan) { restartEvents.append($0, $1) }
+                guard restartWarnings.isEmpty,
+                      restartEvents.all.filter({ $0.0 == .service("one") && $0.1 }).count == 1,
+                      restartEvents.all.filter({ $0.0 == .service("two") && $0.1 }).count == 1,
+                      try await running(names[0]) == true, try await running(names[1]) == true
+                else { throw CLIError(command: "selftest", message: "restart did not leave both running: \(restartEvents.all)") }
+
+                // start with a never-created container: warning, the rest untouched
+                try await ContainerService.delete(names[1], force: true)
+                let missingWarnings = try await Compose.start(plan: plan) { _, _ in }
+                guard missingWarnings.contains(where: { $0.contains("two has no container") }),
+                      try await running(names[0]) == true
+                else { throw CLIError(command: "selftest", message: "missing-container start warning wrong: \(missingWarnings)") }
+
+                // pull: per-image header + done step; the stage lines between
+                // them depend on the daemon's cache state, so don't assert them
+                let single = try plan.selecting(services: ["one"], activeProfiles: [])
+                let sink = OutputLog()
+                let pullEvents = ProgressLog()
+                try await Compose.pull(
+                    plan: single,
+                    progress: { pullEvents.append($0, $1) },
+                    output: { sink.append($0) })
+                guard sink.text.contains("pull: alpine:latest"),
+                      pullEvents.all.contains(where: { $0.0 == .service("one") && $0.1 })
+                else { throw CLIError(command: "selftest", message: "pull output wrong: \(sink.text.debugDescription) \(pullEvents.all)") }
             } catch {
                 await cleanup()
                 throw error
