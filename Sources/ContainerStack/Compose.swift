@@ -87,6 +87,8 @@ enum Compose {
         case missingHealthcheck(service: String, dependency: String)
         case noSuchService(String)
         case inactiveProfile(service: String, profile: String)
+        case envFileNotFound(String)
+        case requiredVariable(name: String, message: String)
         case unhealthy(service: String, failures: Int)
         case dependencyExited(service: String)
         case didNotComplete(service: String, exitCode: Int32?)
@@ -101,6 +103,9 @@ enum Compose {
             case .missingHealthcheck(let s, let d): return "service \"\(s)\" needs \"\(d)\" healthy, but \"\(d)\" has no healthcheck"
             case .noSuchService(let s): return "no such service: \(s)"
             case .inactiveProfile(let s, let p): return "service \"\(s)\" requires profile \"\(p)\" — activate it with --profile \(p)"
+            case .envFileNotFound(let p): return "env file not found: \(p)"
+            case .requiredVariable(let name, let message):
+                return "required variable \"\(name)\" is not set" + (message.isEmpty ? "" : ": \(message)")
             case .unhealthy(let s, let n): return "service \"\(s)\" is unhealthy after \(n) failed probes"
             case .dependencyExited(let s): return "service \"\(s)\" exited before becoming healthy"
             case .didNotComplete(let s, let code):
@@ -144,13 +149,153 @@ enum Compose {
         }
     }
 
+    // MARK: environment + interpolation
+
+    /// KEY=VALUE dotenv subset: whitespace trimmed, blank and #-comment lines
+    /// skipped, optional `export ` prefix, one matching pair of single or
+    /// double quotes stripped from the value — no escape processing beyond that.
+    private static func parseDotEnv(text: String) -> [String: String] {
+        var out: [String: String] = [:]
+        for line in text.split(separator: "\n") {
+            var entry = line.trimmingCharacters(in: .whitespaces)
+            if entry.isEmpty || entry.hasPrefix("#") { continue }
+            if entry.hasPrefix("export ") { entry = String(entry.dropFirst("export ".count)) }
+            guard let eq = entry.firstIndex(of: "=") else { continue }
+            let key = entry[..<eq].trimmingCharacters(in: .whitespaces)
+            guard !key.isEmpty else { continue }
+            var value = entry[entry.index(after: eq)...].trimmingCharacters(in: .whitespaces)
+            if value.count >= 2,
+               (value.hasPrefix("\"") && value.hasSuffix("\"")) || (value.hasPrefix("'") && value.hasSuffix("'")) {
+                value = String(value.dropFirst().dropLast())
+            }
+            out[key] = value
+        }
+        return out
+    }
+
+    /// The environment interpolation sees: `<composeDir>/.env` (or an explicit
+    /// env file) layered under the process environment — process wins (docker
+    /// precedence). A missing default `.env` is simply absent; a missing
+    /// explicit file is an error.
+    static func effectiveEnvironment(
+        composeDir: String,
+        envFile: String? = nil,
+        processEnvironment: [String: String] = ProcessInfo.processInfo.environment
+    ) throws -> [String: String] {
+        let path = envFile ?? URL(fileURLWithPath: composeDir).appendingPathComponent(".env").path
+        guard let text = try? String(contentsOfFile: path, encoding: .utf8) else {
+            if envFile != nil { throw Error.envFileNotFound(path) }
+            return processEnvironment
+        }
+        return parseDotEnv(text: text).merging(processEnvironment) { _, process in process }
+    }
+
+    /// Replaces `${VAR}` in every string VALUE of the loaded YAML tree (never
+    /// mapping keys), so the per-key parsing only ever sees resolved values.
+    private static func interpolate(
+        _ node: Any, environment: [String: String], warned: inout Set<String>, warnings: inout [String]
+    ) throws -> Any {
+        switch node {
+        case let s as String:
+            return try substitute(s, environment: environment, warned: &warned, warnings: &warnings)
+        case let map as [String: Any]:
+            var out = map
+            for (k, v) in map { out[k] = try interpolate(v, environment: environment, warned: &warned, warnings: &warnings) }
+            return out
+        case let list as [Any]:
+            return try list.map { try interpolate($0, environment: environment, warned: &warned, warnings: &warnings) }
+        default:
+            return node
+        }
+    }
+
+    /// Compose substitution grammar: `$VAR`, `${VAR}`, `${VAR:-def}`,
+    /// `${VAR-def}`, `${VAR:?err}`, `${VAR?err}`, `$$` → literal `$`; the `:`
+    /// variants treat set-but-empty as unset. Unset plain substitution → empty
+    /// string plus one warning per variable. Single pass, single level — a
+    /// default is taken literally, nested `${…}` inside it is not expanded.
+    private static func substitute(
+        _ s: String, environment: [String: String], warned: inout Set<String>, warnings: inout [String]
+    ) throws -> String {
+        guard s.contains("$") else { return s }
+        func nameStart(_ c: Character) -> Bool { c == "_" || ("A"..."Z").contains(c) || ("a"..."z").contains(c) }
+        func nameChar(_ c: Character) -> Bool { nameStart(c) || ("0"..."9").contains(c) }
+        func lookup(_ name: String) -> String {
+            if let value = environment[name] { return value }
+            if warned.insert(name).inserted {
+                warnings.append("variable \"\(name)\" is not set — substituting an empty string")
+            }
+            return ""
+        }
+        var out = ""
+        var i = s.startIndex
+        while i < s.endIndex {
+            guard s[i] == "$", s.index(after: i) < s.endIndex else {
+                out.append(s[i]); i = s.index(after: i); continue
+            }
+            let next = s.index(after: i)
+            if s[next] == "$" {                                    // $$ → literal $
+                out.append("$")
+                i = s.index(after: next)
+            } else if s[next] == "{" {
+                guard let close = s[s.index(after: next)...].firstIndex(of: "}") else {
+                    out += s[i...]                                 // unterminated ${… — literal
+                    break
+                }
+                let body = s[s.index(after: next)..<close]
+                var j = body.startIndex
+                while j < body.endIndex, nameChar(body[j]) { j = body.index(after: j) }
+                let name = String(body[..<j])
+                let rest = body[j...]
+                let emptyIsUnset = rest.hasPrefix(":")
+                let op = emptyIsUnset ? rest.dropFirst() : rest
+                let value = environment[name].flatMap { emptyIsUnset && $0.isEmpty ? nil : $0 }
+                if name.isEmpty {
+                    out += s[i...close]                            // "${}" and friends — literal
+                } else if rest.isEmpty {                           // ${VAR}
+                    out += lookup(name)
+                } else if op.hasPrefix("-") {                      // ${VAR-def} / ${VAR:-def}
+                    out += value ?? String(op.dropFirst())
+                } else if op.hasPrefix("?") {                      // ${VAR?err} / ${VAR:?err}
+                    guard let value else {
+                        throw Error.requiredVariable(name: name, message: String(op.dropFirst()))
+                    }
+                    out += value
+                } else {
+                    warnings.append("\"${\(body)}\" is not a supported substitution — left as-is")
+                    out += s[i...close]
+                }
+                i = s.index(after: close)
+            } else if nameStart(s[next]) {                         // bare $VAR
+                var j = s.index(after: next)
+                while j < s.endIndex, nameChar(s[j]) { j = s.index(after: j) }
+                out += lookup(String(s[next..<j]))
+                i = j
+            } else {
+                out.append("$")                                    // $ before a non-name char — literal
+                i = next
+            }
+        }
+        return out
+    }
+
     // MARK: parse
 
-    static func parse(text: String, projectName: String, baseDir: String? = nil) throws -> Plan {
-        guard let root = try Yams.load(yaml: text) as? [String: Any] else { throw Error.notAMapping }
-        guard let services = root["services"] as? [String: Any], !services.isEmpty else { throw Error.noServices }
+    static func parse(
+        text: String, projectName: String, baseDir: String? = nil,
+        environment: [String: String] = [:]
+    ) throws -> Plan {
+        guard let loaded = try Yams.load(yaml: text) as? [String: Any] else { throw Error.notAMapping }
 
         var warnings: [String] = []
+        // Interpolate before any per-key parsing, so ports, volumes, durations
+        // and commands below only ever see resolved values.
+        var warnedUnset = Set<String>()
+        guard let root = try interpolate(
+            loaded, environment: environment, warned: &warnedUnset, warnings: &warnings) as? [String: Any]
+        else { throw Error.notAMapping }
+        guard let services = root["services"] as? [String: Any], !services.isEmpty else { throw Error.noServices }
+
         if root["version"] != nil { /* informational only in modern compose; ignore silently */ }
         for key in root.keys where !["services", "volumes", "networks", "version", "name"].contains(key) {
             warnings.append("top-level \"\(key)\" is ignored")
@@ -167,7 +312,8 @@ enum Compose {
                 continue
             }
             let (plan, svcWarnings) = try parseService(
-                key: svcName, svc: svc, project: project, declaredNetworks: topNetworks, baseDir: baseDir)
+                key: svcName, svc: svc, project: project, declaredNetworks: topNetworks,
+                baseDir: baseDir, environment: environment)
             plans[svcName] = plan
             warnings += svcWarnings
         }
@@ -198,7 +344,8 @@ enum Compose {
     // MARK: service
 
     private static func parseService(
-        key: String, svc: [String: Any], project: String, declaredNetworks: [String], baseDir: String?
+        key: String, svc: [String: Any], project: String, declaredNetworks: [String],
+        baseDir: String?, environment: [String: String]
     ) throws -> (ServicePlan, warnings: [String]) {
         var warnings: [String] = []
 
@@ -218,7 +365,18 @@ enum Compose {
                 process += ["--env", "\(k)=\(scalarString(v))"]
             }
         case let list as [Any]:
-            for entry in list { process += ["--env", scalarString(entry)] }
+            // KEY=VALUE passes through; a bare KEY resolves from the effective
+            // environment (docker parity) or is omitted with a warning.
+            for entry in list {
+                let s = scalarString(entry)
+                if s.contains("=") {
+                    process += ["--env", s]
+                } else if let value = environment[s] {
+                    process += ["--env", "\(s)=\(value)"]
+                } else {
+                    warnings.append("\(key): environment variable \(s) is not set — omitted")
+                }
+            }
         case nil: break
         default: warnings.append("\(key): unrecognized environment format — ignored")
         }

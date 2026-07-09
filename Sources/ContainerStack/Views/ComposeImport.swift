@@ -205,8 +205,10 @@ enum ComposeImport {
         do {
             let text = try String(contentsOf: url, encoding: .utf8)
             let dir = url.deletingLastPathComponent()
+            // The file's sibling .env participates automatically, like docker.
+            let environment = try Compose.effectiveEnvironment(composeDir: dir.path)
             let plan = try parseFiltered(
-                text: text, projectName: dir.lastPathComponent, baseDir: dir.path)
+                text: text, projectName: dir.lastPathComponent, baseDir: dir.path, environment: environment)
             return .success(plan)
         } catch {
             let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
@@ -217,8 +219,10 @@ enum ComposeImport {
     /// Parse for the GUI import: the sheet has no profile picker (v1), so
     /// profile-gated services are excluded like docker's default and surfaced
     /// as info warnings pointing at the CLI.
-    static func parseFiltered(text: String, projectName: String, baseDir: String?) throws -> Compose.Plan {
-        let parsed = try Compose.parse(text: text, projectName: projectName, baseDir: baseDir)
+    static func parseFiltered(
+        text: String, projectName: String, baseDir: String?, environment: [String: String] = [:]
+    ) throws -> Compose.Plan {
+        let parsed = try Compose.parse(text: text, projectName: projectName, baseDir: baseDir, environment: environment)
         var plan = try parsed.selecting(services: [], activeProfiles: [])
         let kept = Set(plan.services.map(\.service))
         for svc in parsed.services where !kept.contains(svc.service) {

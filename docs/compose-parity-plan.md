@@ -123,7 +123,7 @@ follow-up tasks F1/F2 below on user request, 2026-07-09.)
   that currently expect the host IP to be dropped (Main.swift compose parse step) to
   expect passthrough. Done when: build + full selftest OK. Commit:
   `compose: publish host-IP bindings`.
-- [ ] **F2 — .env + ${VAR} interpolation.** Implement decision 9: dotenv parser
+- [x] **F2 — .env + ${VAR} interpolation.** Implement decision 9: dotenv parser
   (KEY=VALUE, `#` comments, blank lines, optional `export `, single/double-quote
   stripping), `Compose.effectiveEnvironment(composeDir:envFile:)` helper, interpolation
   pass, bare-KEY resolution, `--env-file` flag + usage update, GUI wiring, README

@@ -223,16 +223,17 @@ enum Main {
             return
         }
         if args.count >= 2, args[1] == "compose" {
-            // usage: compose plan|up [-f <file>] [--profile <name>]... [service...]
+            // usage: compose plan|up [-f <file>] [--env-file <path>] [--profile <name>]... [service...]
             // plan parses + prints (no side effects); up also creates volumes/networks
             // and starts services. Without -f the file is autodiscovered like docker;
-            // naming services selects them plus their depends_on closure.
-            let usage = "usage: compose plan|up [-f <file>] [--profile <name>]... [service...]\n"
+            // naming services selects them plus their depends_on closure. ${VAR}
+            // interpolation reads the file's sibling .env unless --env-file overrides.
+            let usage = "usage: compose plan|up [-f <file>] [--env-file <path>] [--profile <name>]... [service...]\n"
             guard args.count >= 3, args[2] == "plan" || args[2] == "up" else {
                 FileHandle.standardError.write(Data(usage.utf8)); exit(2)
             }
             let sub = args[2]
-            var file: String?, profiles: [String] = [], serviceNames: [String] = []
+            var file: String?, envFile: String?, profiles: [String] = [], serviceNames: [String] = []
             let hasFileFlag = args.contains("-f") || args.contains("--file")
             var i = 3
             while i < args.count {
@@ -240,6 +241,9 @@ enum Main {
                 case "-f", "--file":
                     guard i + 1 < args.count else { FileHandle.standardError.write(Data(usage.utf8)); exit(2) }
                     file = (args[i + 1] as NSString).expandingTildeInPath; i += 1
+                case "--env-file":
+                    guard i + 1 < args.count else { FileHandle.standardError.write(Data(usage.utf8)); exit(2) }
+                    envFile = (args[i + 1] as NSString).expandingTildeInPath; i += 1
                 case "--profile":
                     guard i + 1 < args.count else { FileHandle.standardError.write(Data(usage.utf8)); exit(2) }
                     profiles.append(args[i + 1]); i += 1
@@ -275,12 +279,15 @@ enum Main {
             let discoveryWarning = discovered?.warning
             let requested = serviceNames
             let activeProfiles = profiles
+            let envFilePath = envFile
             let semaphore = DispatchSemaphore(value: 0)
             Task.detached {
                 do {
                     let text = try String(contentsOfFile: path, encoding: .utf8)
                     let dir = URL(fileURLWithPath: path).deletingLastPathComponent()
-                    let plan = try Compose.parse(text: text, projectName: dir.lastPathComponent, baseDir: dir.path)
+                    let environment = try Compose.effectiveEnvironment(composeDir: dir.path, envFile: envFilePath)
+                    let plan = try Compose.parse(
+                        text: text, projectName: dir.lastPathComponent, baseDir: dir.path, environment: environment)
                         .selecting(services: requested, activeProfiles: activeProfiles)
                     if autodiscovered { print("file: \(path)") }
                     print("project: \(plan.project)")
@@ -764,6 +771,102 @@ enum SelfTest {
                   Compose.discoverFile(startingAt: nested.path, environment: ["COMPOSE_FILE": "custom.yaml"])?.path
                       == nested.appendingPathComponent("custom.yaml").path
             else { throw CLIError(command: "selftest", message: "COMPOSE_FILE override not honored") }
+        }
+        await step("compose: .env + interpolation") {
+            let fm = FileManager.default
+            let dir = fm.temporaryDirectory.appendingPathComponent("davit-selftest-env-\(UUID().uuidString)")
+            let altDir = fm.temporaryDirectory.appendingPathComponent("davit-selftest-envalt-\(UUID().uuidString)")
+            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            try fm.createDirectory(at: altDir, withIntermediateDirectories: true)
+            defer { try? fm.removeItem(at: dir); try? fm.removeItem(at: altDir) }
+            try """
+            # dotenv fixture
+            TAG=3.19
+            export EXPORTED=yes
+            QUOTED="q value"
+            SINGLE='s value'
+            EMPTY=
+              SPACED  =  padded
+            SHARED=dotenv
+            not a key-value line
+            """.write(to: dir.appendingPathComponent(".env"), atomically: true, encoding: .utf8)
+
+            // default <dir>/.env layered under the process env — process wins
+            let env = try Compose.effectiveEnvironment(
+                composeDir: dir.path, processEnvironment: ["SHARED": "process", "PROC_ONLY": "1"])
+            guard env["TAG"] == "3.19", env["EXPORTED"] == "yes",
+                  env["QUOTED"] == "q value", env["SINGLE"] == "s value",
+                  env["EMPTY"] == "", env["SPACED"] == "padded",
+                  env["SHARED"] == "process", env["PROC_ONLY"] == "1"
+            else { throw CLIError(command: "selftest", message: "effectiveEnvironment wrong: \(env)") }
+
+            // absent default .env → just the process env; missing explicit file → error
+            guard try Compose.effectiveEnvironment(composeDir: altDir.path, processEnvironment: ["A": "b"]) == ["A": "b"] else {
+                throw CLIError(command: "selftest", message: "absent default .env should yield the process env")
+            }
+            do {
+                _ = try Compose.effectiveEnvironment(
+                    composeDir: dir.path, envFile: altDir.appendingPathComponent("nope.env").path)
+                throw CLIError(command: "selftest", message: "missing explicit env file not rejected")
+            } catch Compose.Error.envFileNotFound { /* expected */ }
+            // --env-file replaces the default .env, it doesn't merge with it
+            try "ONLY=here\n".write(to: altDir.appendingPathComponent("alt.env"), atomically: true, encoding: .utf8)
+            guard try Compose.effectiveEnvironment(
+                composeDir: dir.path, envFile: altDir.appendingPathComponent("alt.env").path,
+                processEnvironment: [:]) == ["ONLY": "here"]
+            else { throw CLIError(command: "selftest", message: "--env-file override wrong") }
+
+            // interpolation: every string value, resolved before per-key parsing
+            let yaml = """
+            services:
+              app:
+                image: alpine:${TAG}
+                environment:
+                  - PLAIN=$EXPORTED
+                  - CURLY=${SHARED}
+                  - LITERAL=$$HOME
+                  - DEF=${MISSING:-fallback}
+                  - COLON_EMPTY=${EMPTY:-fell}
+                  - KEEP_EMPTY=${EMPTY-kept}
+                  - GONE=${MISSING}${MISSING}
+                  - PROC_ONLY
+                  - ABSENT_KEY
+                command: ["echo", "${EMPTY:-was-empty}"]
+            volumes: { $notakey: }
+            """
+            let plan = try Compose.parse(text: yaml, projectName: "env", environment: env)
+            guard plan.services[0].image == "alpine:3.19" else {
+                throw CLIError(command: "selftest", message: "image not interpolated: \(plan.services[0].image)")
+            }
+            guard plan.services[0].processArgs == [
+                "--env", "PLAIN=yes", "--env", "CURLY=process", "--env", "LITERAL=$HOME",
+                "--env", "DEF=fallback", "--env", "COLON_EMPTY=fell", "--env", "KEEP_EMPTY=",
+                "--env", "GONE=", "--env", "PROC_ONLY=1",
+            ] else { throw CLIError(command: "selftest", message: "env interpolation wrong: \(plan.services[0].processArgs)") }
+            guard plan.services[0].commandArgs == ["echo", "was-empty"] else {
+                throw CLIError(command: "selftest", message: "command not interpolated: \(plan.services[0].commandArgs)")
+            }
+            guard plan.volumes == ["$notakey"] else {
+                throw CLIError(command: "selftest", message: "mapping keys must not be interpolated: \(plan.volumes)")
+            }
+            // unset plain → empty + ONE warning per variable; absent bare KEY → omitted + warning
+            guard plan.warnings.filter({ $0.contains("\"MISSING\"") }).count == 1,
+                  plan.warnings.contains(where: { $0.contains("ABSENT_KEY is not set — omitted") })
+            else { throw CLIError(command: "selftest", message: "interpolation warnings wrong: \(plan.warnings)") }
+
+            // :? / ? — unset (or empty with :) throws; set-but-empty without : passes
+            do {
+                _ = try Compose.parse(text: "services: {a: {image: \"x:${MISSING:?tag required}\"}}", projectName: "req")
+                throw CLIError(command: "selftest", message: ":? unset not rejected")
+            } catch Compose.Error.requiredVariable(name: "MISSING", message: "tag required") { /* expected */ }
+            do {
+                _ = try Compose.parse(text: "services: {a: {image: \"x${EMPTY:?must not be empty}\"}}",
+                                      projectName: "req2", environment: ["EMPTY": ""])
+                throw CLIError(command: "selftest", message: ":? set-but-empty not rejected")
+            } catch Compose.Error.requiredVariable(name: "EMPTY", message: _) { /* expected */ }
+            guard try Compose.parse(text: "services: {a: {image: \"x${EMPTY?err}y\"}}",
+                                    projectName: "q", environment: ["EMPTY": ""]).services[0].image == "xy"
+            else { throw CLIError(command: "selftest", message: "? should accept a set-but-empty variable") }
         }
         await step("compose: up with depends_on conditions") {
             let containers = ["davit-selftest-compose-db", "davit-selftest-compose-init",
