@@ -61,6 +61,7 @@ enum Compose {
         var externalVolumes: Set<String>   // declared `external:` — down leaves them alone
         var externalNetworks: Set<String>
         var services: [ServicePlan]  // in dependency start order
+        var allServices: [ServicePlan]  // every service in the file, regardless of selection/profiles — hosts sync must cover unselected running containers too
         var warnings: [String]
     }
 
@@ -86,6 +87,7 @@ enum Compose {
     enum Error: Swift.Error, LocalizedError {
         case notAMapping
         case noServices
+        case invalidServiceName(String)
         case missingImage(service: String)
         case dependencyCycle([String])
         case unknownDependency(service: String, dependsOn: String)
@@ -103,6 +105,8 @@ enum Compose {
             switch self {
             case .notAMapping: return "not a compose file (top level is not a mapping)"
             case .noServices: return "no services defined"
+            case .invalidServiceName(let s):
+                return "service name \(s.debugDescription) is invalid — only [a-zA-Z0-9._-] is allowed"
             case .missingImage(let s): return "service \"\(s)\" has no image — build: is not supported yet"
             case .dependencyCycle(let names): return "depends_on cycle: \(names.joined(separator: " → "))"
             case .unknownDependency(let s, let d): return "service \"\(s)\" depends on unknown service \"\(d)\""
@@ -324,6 +328,12 @@ enum Compose {
 
         var plans: [String: ServicePlan] = [:]
         for (svcName, svcAny) in services {
+            // Docker's service-name charset. Beyond parity this protects the
+            // managed /etc/hosts block: names end up as line content there,
+            // and whitespace (or a quoted-key newline) would break out of it.
+            guard svcName.range(of: "^[A-Za-z0-9._-]+$", options: .regularExpression) != nil else {
+                throw Error.invalidServiceName(svcName)
+            }
             guard let svc = svcAny as? [String: Any] else {
                 warnings.append("service \"\(svcName)\" is not a mapping — skipped")
                 continue
@@ -349,13 +359,15 @@ enum Compose {
             }
         }
 
+        let orderedPlans = ordered.compactMap { plans[$0] }
         return Plan(
             project: project,
             volumes: topVolumes.sorted(),
             networks: topNetworks.sorted(),
             externalVolumes: externalVolumes,
             externalNetworks: externalNetworks,
-            services: ordered.compactMap { plans[$0] },
+            services: orderedPlans,
+            allServices: orderedPlans,
             warnings: warnings
         )
     }
@@ -379,10 +391,12 @@ enum Compose {
 
         // env_file: string, list, or {path, required} entries — paths resolve
         // against the compose file's directory; contents load through the
-        // dotenv parser and are NOT interpolated (docker parity: only the
-        // compose file itself interpolates). Later files override earlier
-        // ones; environment: below overrides them all. A missing file is an
-        // error unless the entry says `required: false`.
+        // dotenv parser and are NOT interpolated — a deliberate deviation:
+        // compose v2 expands ${VAR} inside env-file values (single-quoted
+        // ones excepted), here every value passes through literally. Later
+        // files override earlier ones; environment: below overrides them
+        // all. A missing file is an error unless the entry says
+        // `required: false`.
         var envFileSpecs: [(path: String, required: Bool)] = []
         func envFileSpec(_ entry: Any) {
             if let m = entry as? [String: Any] {
@@ -798,7 +812,12 @@ extension Compose.Plan {
     /// dependency pulled in by closure whose profiles all stay inactive is an
     /// error. Created volumes/networks are pruned to what the selected services
     /// reference. Empty `services` = every enabled one.
-    func selecting(services requested: [String], activeProfiles: [String]) throws -> Compose.Plan {
+    /// `includeDependencies: false` keeps EXACTLY the named services — docker's
+    /// scoping for stop/start/restart/pull/ps, where pulling in a dependency
+    /// would stop a db that other services still use.
+    func selecting(
+        services requested: [String], activeProfiles: [String], includeDependencies: Bool = true
+    ) throws -> Compose.Plan {
         let byName = Dictionary(uniqueKeysWithValues: services.map { ($0.service, $0) })
         for name in requested where byName[name] == nil {
             throw Compose.Error.noSuchService(name)
@@ -817,7 +836,7 @@ extension Compose.Plan {
                 throw Compose.Error.inactiveProfile(service: name, profile: svc.profiles.first ?? "?")
             }
             selected.insert(name)
-            queue += svc.dependsOn.keys.sorted()
+            if includeDependencies { queue += svc.dependsOn.keys.sorted() }
         }
 
         let kept = services.filter { selected.contains($0.service) }
@@ -830,6 +849,7 @@ extension Compose.Plan {
             externalVolumes: externalVolumes,
             externalNetworks: externalNetworks,
             services: kept,
+            allServices: allServices,
             warnings: warnings)
     }
 }
@@ -850,9 +870,21 @@ actor ComposeExitCodes {
     /// and displaced tasks are cancelled — best effort only: the underlying XPC
     /// wait ignores cancellation, so a cancelled task still lives until its
     /// process exits; it just stops being tracked here.
-    func register(id: String, process: ClientProcess) {
+    ///
+    /// Call BEFORE starting the process: register returns only once the
+    /// watcher task is executing, so its wait request is on the wire before
+    /// the caller's start request. A wait issued after start races a fast
+    /// one-shot — the apiserver reaps the runtime client the moment the init
+    /// process exits, and a wait arriving after that errors, losing the code.
+    /// (Waits are valid from bootstrap on; they don't need a started process.)
+    func register(id: String, process: ClientProcess) async {
         waits[id]?.cancel()
-        waits[id] = Task { try? await process.wait() }
+        await withCheckedContinuation { started in
+            waits[id] = Task {
+                started.resume()
+                return try? await process.wait()
+            }
+        }
         order.removeAll { $0 == id }
         order.append(id)
         if order.count > 64 { waits.removeValue(forKey: order.removeFirst())?.cancel() }
@@ -892,12 +924,14 @@ extension Compose {
     /// a stopped one is force-deleted and recreated from the plan — the file wins.
     /// Reports each step; stops at the first failure (already-completed steps stay
     /// up, like compose does). Once every service is up — reused ones included —
-    /// the project's /etc/hosts entries are re-synced (syncProjectHosts below);
-    /// its warnings are the return value.
+    /// the project's /etc/hosts entries are re-synced (syncProjectHosts below).
+    /// Returns the sync warnings plus the set of services that were reused
+    /// untouched — the CLI's log attach skips those containers' backlog, like
+    /// docker only replays history for containers the up actually created.
     static func up(
         plan: Plan,
         progress: @escaping @Sendable (StepKind, _ done: Bool) async -> Void
-    ) async throws -> [String] {
+    ) async throws -> (warnings: [String], reused: Set<String>) {
         let existingVolumes = Set((try? await ContainerService.listVolumes())?.map(\.name) ?? [])
         for volume in plan.volumes where !existingVolumes.contains(volume) {
             await progress(.volume(volume), false)
@@ -932,10 +966,12 @@ extension Compose {
         let preexisting = Dictionary(uniqueKeysWithValues:
             ((try? await ContainerService.listContainers()) ?? []).map { ($0.id, $0.isRunning) })
 
+        var reused = Set<String>()
         for svc in plan.services {
             // Already running under the target name → reuse as-is; its own
             // dependencies were satisfied when it started, so skip the waits too.
             if preexisting[svc.name] == true {
+                reused.insert(svc.service)
                 await progress(.service(svc.service), false)
                 await progress(.service(svc.service), true)
                 continue
@@ -979,7 +1015,7 @@ extension Compose {
             await progress(.service(svc.service), true)
         }
 
-        return await syncProjectHosts(plan: plan)
+        return (await syncProjectHosts(plan: plan), reused)
     }
 
     /// Compose service names never resolve from inside containers on this
@@ -994,13 +1030,16 @@ extension Compose {
     /// carry a `# davit-compose` suffix; the rewrite filters the previous
     /// block out and writes back into the same file (same inode — never mv),
     /// then appends the fresh entries, one /bin/sh invocation per container.
+    /// The whole PROJECT is covered regardless of what the caller selected
+    /// (plan.allServices): a scoped `up web` must not erase the entries of a
+    /// still-running unselected service, and that service needs web's new IP.
     /// A container that can't be patched (no usable /bin/sh, read-only
     /// /etc/hosts) yields a warning, never a failure. Containers recreated
     /// behind compose's back keep stale entries until the next up/start.
     static func syncProjectHosts(plan: Plan) async -> [String] {
         let records = Dictionary(uniqueKeysWithValues:
             ((try? await ContainerService.listContainers()) ?? []).map { ($0.id, $0) })
-        let entries: [(service: String, name: String, ip: String)] = plan.services.compactMap { svc in
+        let entries: [(service: String, name: String, ip: String)] = plan.allServices.compactMap { svc in
             guard let record = records[svc.name], record.isRunning, let ip = record.primaryIPv4 else { return nil }
             return (svc.service, svc.name, ip)
         }
@@ -1016,17 +1055,27 @@ extension Compose {
         """
         var warnings: [String] = []
         for entry in entries {
+            // asRoot: /etc/hosts is root:root 644 — containers whose default user
+            // is non-root (e.g. the postgres image runs as `postgres`) can't write
+            // it as themselves.
             let result = try? await ContainerService.exec(
-                entry.name, ["/bin/sh", "-c", script, "davit", block], timeout: .seconds(30))
+                entry.name, ["/bin/sh", "-c", script, "davit", block], timeout: .seconds(30), asRoot: true)
             if result?.exitCode != 0 {
-                warnings.append("service \(entry.service): /etc/hosts not updated (image without /bin/sh?) — service names won't resolve there")
+                // A one-shot can exit between the snapshot and the exec — an
+                // exited container needs no entries, so only a still-running
+                // one that can't be patched is worth a warning.
+                let live = (try? await ContainerService.listContainers()) ?? []
+                guard live.first(where: { $0.id == entry.name })?.isRunning == true else { continue }
+                warnings.append("service \(entry.service): could not update /etc/hosts (no /bin/sh in this image?) — service names won't resolve there")
             }
         }
         return warnings
     }
 
     /// Tear the plan down: stop each existing container in reverse dependency
-    /// order — honoring stop_grace_period / stop_signal — then force-delete it.
+    /// order — honoring stop_grace_period / stop_signal — then force-delete it
+    /// (a failed stop warns and the delete still runs; down must not strand
+    /// the rest of the project behind one wedged container).
     /// Naming `services` scopes the teardown to exactly those (no dependency
     /// closure: deleting a dependency out from under the services still using
     /// it would surprise); only a FULL project down also deletes the declared
@@ -1049,7 +1098,15 @@ extension Compose {
         for svc in plan.services.reversed() where selected.contains(svc.service) {
             guard let running = existing[svc.name] else { continue }  // never created
             await progress(.service(svc.service), false)
-            if running { try await stopContainer(svc) }
+            if running {
+                // A stop that fails must not abort the teardown — the force-
+                // delete below removes the container either way (docker keeps
+                // going too); the user just gets told it wasn't graceful.
+                do { try await stopContainer(svc) } catch {
+                    let detail = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+                    warnings.append("service \(svc.service): stop failed (\(detail)) — deleting by force")
+                }
+            }
             try await ContainerService.delete(svc.name, force: true)
             await progress(.service(svc.service), true)
         }
@@ -1254,15 +1311,19 @@ extension Compose {
     /// `<container>  | ` with the prefix column aligned across containers.
     /// Naming `services` scopes the output to exactly those (no dependency
     /// closure — docker parity); never-created containers are skipped. `tail`
-    /// limits the backlog per container (nil = everything). With `follow` the
-    /// backlog is followed by a readability handler per container printing new
-    /// lines as they arrive, and the call never returns — Ctrl-C ends the
-    /// process (the containers keep running). `output` receives whole prefixed
-    /// lines (stdout by default) so the selftest can capture the non-follow path.
+    /// limits the backlog per container (nil = everything); services in
+    /// `skipBacklogFor` show none at all — up's attach passes its reused set,
+    /// so only containers that up actually created replay history (docker
+    /// behavior). With `follow` the backlog is followed by a readability
+    /// handler per container printing new lines as they arrive, and the call
+    /// never returns — Ctrl-C ends the process (the containers keep running).
+    /// `output` receives whole prefixed lines (stdout by default) so the
+    /// selftest can capture the non-follow path.
     static func logs(
         plan: Plan,
         services requested: [String] = [],
         tail: Int? = nil,
+        skipBacklogFor: Set<String> = [],
         follow: Bool = false,
         output: @escaping @Sendable (String) -> Void = { FileHandle.standardOutput.write(Data($0.utf8)) }
     ) async throws {
@@ -1277,20 +1338,24 @@ extension Compose {
         let existing = Set(try await ContainerService.listContainers().map(\.id))
         let targets = plan.services.filter { selected.contains($0.service) && existing.contains($0.name) }
         let width = targets.map(\.name.count).max() ?? 0
-        var streams: [(prefix: String, name: String, handle: FileHandle)] = []
+        var streams: [(prefix: String, name: String, handle: FileHandle, backlog: Bool)] = []
         for svc in targets {
             // Index 0 is the stdio log, 1 the boot log (LogStreamer convention);
-            // a container deleted since the snapshot just drops out.
+            // a container deleted since the snapshot just drops out. The fds
+            // come dup'd from XPC with closeOnDealloc off — close what we
+            // don't keep or every call leaks the boot-log descriptor.
             guard let handles = try? await ContainerClient().logs(id: svc.name), !handles.isEmpty else { continue }
+            for extra in handles.dropFirst() { try? extra.close() }
             let prefix = svc.name.padding(toLength: width, withPad: " ", startingAt: 0) + "  | "
-            streams.append((prefix, svc.name, handles[0]))
+            streams.append((prefix, svc.name, handles[0], !skipBacklogFor.contains(svc.service)))
         }
 
         for stream in streams {
             // Remember the end of file before the backwards tail read, so the
             // follow handler below resumes exactly where the backlog ended.
             let end = (try? stream.handle.seekToEnd()) ?? 0
-            for line in LogStreamer.readTail(fh: stream.handle, maxLines: tail.map { max(0, $0) } ?? Int.max) {
+            let maxLines = stream.backlog ? (tail.map { max(0, $0) } ?? Int.max) : 0
+            for line in LogStreamer.readTail(fh: stream.handle, maxLines: maxLines) {
                 output(stream.prefix + line + "\n")
             }
             try? stream.handle.seek(toOffset: end)

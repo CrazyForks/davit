@@ -41,7 +41,7 @@ extension ContainerService {
     /// Runs a command inside the container and captures stdout/stderr. Not a TTY.
     /// With `timeout`, throws `ExecTimeout` once it elapses (see there — the
     /// process is abandoned, not killed).
-    static func exec(_ id: String, _ argv: [String], timeout: Duration? = nil) async throws -> ExecResult {
+    static func exec(_ id: String, _ argv: [String], timeout: Duration? = nil, asRoot: Bool = false) async throws -> ExecResult {
         let client = ContainerClient()
         let container = try await client.get(id: id)
         var config = container.configuration.initProcess
@@ -49,6 +49,9 @@ extension ContainerService {
         config.arguments = Array(argv.dropFirst())
         config.terminal = false
         config.workingDirectory = "/"
+        // /etc/hosts is root:root 644 — a container whose default user is non-root
+        // (e.g. the postgres image runs as `postgres`) can't write it as itself.
+        if asRoot { config.user = .id(uid: 0, gid: 0) }
 
         let outPipe = Pipe()
         let errPipe = Pipe()

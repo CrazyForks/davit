@@ -353,39 +353,63 @@ enum ComposeCLI {
         "logs": ["--tail": "tail"]
     ]
 
-    /// args = everything after "compose". Exits on usage errors (2) and on a
-    /// path-like positional that doesn't exist (1) — runs before any async work.
+    /// args = everything after "compose". Exits on usage errors (2, naming the
+    /// offending token) and on a path-like positional that doesn't exist (1) —
+    /// runs before any async work. Flags take their value as the next token or
+    /// inline (`--tail=5`); `--tail all` is docker's spelling for unlimited.
     static func parse(_ args: [String]) -> Invocation {
-        func usageExit() -> Never {
-            FileHandle.standardError.write(Data((usage + "\n").utf8)); exit(2)
+        func usageExit(_ message: String? = nil) -> Never {
+            let prefix = message.map { $0 + "\n" } ?? ""
+            FileHandle.standardError.write(Data((prefix + usage + "\n").utf8)); exit(2)
         }
-        guard let sub = args.first, subcommands.contains(sub) else { usageExit() }
+        guard let sub = args.first else { usageExit() }
+        guard subcommands.contains(sub) else { usageExit("unknown subcommand: \(sub)") }
         var inv = Invocation(subcommand: sub)
         let bools = boolFlags[sub] ?? [:]
         let ints = intFlags[sub] ?? [:]
         let fileTokens = ["-f", "--file"].filter { bools[$0] == nil && ints[$0] == nil }
         // The file flag may follow a positional (`up web -f x.yml`), so the
         // positional rule below needs to know about it up front.
-        let hasFileFlag = args.contains(where: fileTokens.contains)
+        let hasFileFlag = args.contains { a in
+            fileTokens.contains(a) || fileTokens.contains(where: { a.hasPrefix($0 + "=") })
+        }
         var i = 1
         while i < args.count {
-            let arg = args[i]
+            let raw = args[i]
+            // --flag=value spelling: split for the flag matching below; the
+            // positional branches keep using the untouched token.
+            var arg = raw
+            var inline: String? = nil
+            if raw.hasPrefix("--"), let eq = raw.firstIndex(of: "=") {
+                arg = String(raw[..<eq])
+                inline = String(raw[raw.index(after: eq)...])
+            }
+            func value() -> String {
+                if let v = inline { return v }
+                guard i + 1 < args.count else { usageExit("flag \(arg) needs a value") }
+                i += 1
+                return args[i]
+            }
             if let name = bools[arg] {
+                guard inline == nil else { usageExit("flag \(arg) takes no value") }
                 inv.flags.insert(name)
             } else if let name = ints[arg] {
-                guard i + 1 < args.count, let n = Int(args[i + 1]) else { usageExit() }
-                inv.counts[name] = n; i += 1
+                let v = value()
+                if v == "all" {
+                    inv.counts[name] = nil  // docker's explicit default — unlimited
+                } else if let n = Int(v) {
+                    inv.counts[name] = n
+                } else {
+                    usageExit("invalid \(arg) value: \(v)")
+                }
             } else if fileTokens.contains(arg) {
-                guard i + 1 < args.count else { usageExit() }
-                inv.file = (args[i + 1] as NSString).expandingTildeInPath; i += 1
+                inv.file = (value() as NSString).expandingTildeInPath
             } else if arg == "--env-file" {
-                guard i + 1 < args.count else { usageExit() }
-                inv.envFile = (args[i + 1] as NSString).expandingTildeInPath; i += 1
+                inv.envFile = (value() as NSString).expandingTildeInPath
             } else if arg == "--profile" {
-                guard i + 1 < args.count else { usageExit() }
-                inv.profiles.append(args[i + 1]); i += 1
-            } else if arg.hasPrefix("-") {
-                FileHandle.standardError.write(Data("unknown flag: \(arg)\n\(usage)\n".utf8)); exit(2)
+                inv.profiles.append(value())
+            } else if raw.hasPrefix("-") {
+                usageExit("unknown flag: \(raw)")
             } else if sub == "exec" {
                 // exec grammar: the first positional is the service, everything
                 // after it is the command verbatim — a later `-f` belongs to
@@ -412,7 +436,9 @@ enum ComposeCLI {
             }
             i += 1
         }
-        if sub == "exec", inv.services.count != 1 || inv.command.isEmpty { usageExit() }
+        if sub == "exec", inv.services.count != 1 || inv.command.isEmpty {
+            usageExit("exec needs a service and a command")
+        }
         // COMPOSE_PROFILES is the fallback when no --profile was given (docker v2).
         if inv.profiles.isEmpty, let env = ProcessInfo.processInfo.environment["COMPOSE_PROFILES"] {
             inv.profiles = env.split(separator: ",").map(String.init).filter { !$0.isEmpty }
@@ -448,16 +474,18 @@ enum ComposeCLI {
                     if let w = discoveryWarning { print("warning: \(w)") }
                     for w in plan.warnings { print("warning: \(w)") }
                     if inv.subcommand == "up" {
-                        let hostWarnings = try await Compose.up(plan: plan) { step, done in
+                        let up = try await Compose.up(plan: plan) { step, done in
                             if done { print("up: \(step.label) done") }
                         }
-                        for w in hostWarnings { print("warning: \(w)") }
+                        for w in up.warnings { print("warning: \(w)") }
                         print("compose up: ok")
                         if !inv.flags.contains("detach") {
                             // docker-compose behavior: a non-detached up stays
-                            // attached to the selected services' logs.
+                            // attached to the selected services' logs — reused
+                            // containers from now on only, so old runs' output
+                            // doesn't replay.
                             print("Attaching to logs (Ctrl-C detaches; containers keep running)")
-                            try await Compose.logs(plan: plan, follow: true)
+                            try await Compose.logs(plan: plan, skipBacklogFor: up.reused, follow: true)
                         }
                     }
                 case "down":
@@ -478,7 +506,12 @@ enum ComposeCLI {
                         plan: parsed, services: inv.services,
                         tail: inv.counts["tail"], follow: inv.flags.contains("follow"))
                 case "stop", "start", "restart", "pull":
-                    let plan = try parsed.selecting(services: inv.services, activeProfiles: inv.profiles)
+                    // Docker parity: these scope to EXACTLY the named services
+                    // — no dependency closure (stopping web must not stop a db
+                    // other services still use; pull adds dependencies only
+                    // with --include-deps). Empty = every enabled service.
+                    let plan = try parsed.selecting(
+                        services: inv.services, activeProfiles: inv.profiles, includeDependencies: false)
                     let sub = inv.subcommand
                     let report: @Sendable (Compose.StepKind, Bool) async -> Void = { step, done in
                         if done { print("\(sub): \(step.label) done") }
@@ -501,7 +534,9 @@ enum ComposeCLI {
                     let container = try await Compose.runningContainer(plan: parsed, service: inv.services[0])
                     await ExecMode.run(containerID: container, argv: inv.command)
                 case "ps":
-                    let plan = try parsed.selecting(services: inv.services, activeProfiles: inv.profiles)
+                    // Like stop/start: `ps web` lists exactly web (docker parity).
+                    let plan = try parsed.selecting(
+                        services: inv.services, activeProfiles: inv.profiles, includeDependencies: false)
                     let records = try await Compose.ps(plan: plan)
                     let rows = [["SERVICE", "CONTAINER", "STATE", "PORTS"]]
                         + records.map { [$0.service, $0.container, $0.state, $0.ports] }
@@ -721,6 +756,13 @@ enum SelfTest {
                 _ = try Compose.parse(text: "services: {a: {image: x, depends_on: [b]}, b: {image: y, depends_on: [a]}}", projectName: "c")
                 throw CLIError(command: "selftest", message: "cycle not rejected")
             } catch Compose.Error.dependencyCycle { /* expected */ }
+
+            // Service names outside docker's charset are rejected (they'd also
+            // corrupt the managed /etc/hosts block — its lines carry them).
+            do {
+                _ = try Compose.parse(text: "services: {\"bad name\": {image: x}}", projectName: "n")
+                throw CLIError(command: "selftest", message: "invalid service name not rejected")
+            } catch Compose.Error.invalidServiceName("bad name") { /* expected */ }
         }
         await step("compose: profiles + healthchecks + depends_on conditions + selection") {
             let yaml = """
@@ -819,6 +861,16 @@ enum SelfTest {
             guard sel.services.map(\.service) == ["db", "init", "web"],
                   sel.volumes == ["dbdata", "webdata"], sel.networks == ["back", "front"]
             else { throw CLIError(command: "selftest", message: "selection wrong: \(sel.services.map(\.service)) \(sel.volumes) \(sel.networks)") }
+            // stop/start/restart/pull/ps scoping: EXACTLY the named services,
+            // no closure (docker parity) — but auto-activation still applies,
+            // and the full service list stays available for the hosts sync.
+            let exact = try plan.selecting(services: ["web"], activeProfiles: [], includeDependencies: false)
+            guard exact.services.map(\.service) == ["web"],
+                  exact.allServices.map(\.service) == plan.services.map(\.service)
+            else { throw CLIError(command: "selftest", message: "exact selection wrong: \(exact.services.map(\.service))") }
+            guard try plan.selecting(services: ["debug"], activeProfiles: [], includeDependencies: false)
+                .services.map(\.service) == ["debug"]
+            else { throw CLIError(command: "selftest", message: "exact selection should auto-activate the named service's profile") }
             // empty selection = all enabled; profile-gated debug drops out, unreferenced volume pruned
             let all = try plan.selecting(services: [], activeProfiles: [])
             guard all.services.map(\.service) == ["db", "init", "cache", "web"], !all.volumes.contains("unused") else {
@@ -1018,8 +1070,9 @@ enum SelfTest {
 
             // All three entry forms; precedence: earlier files < later files <
             // environment:. File contents are NOT interpolated (RAW stays
-            // literal); a bare environment KEY unset in the effective env
-            // falls back to the env_file value without a warning.
+            // literal — a deliberate deviation: compose v2 expands ${VAR} in
+            // env-file values); a bare environment KEY unset in the effective
+            // env falls back to the env_file value without a warning.
             let plan = try Compose.parse(text: """
             services:
               app:
@@ -1304,7 +1357,11 @@ enum SelfTest {
             await cleanup()
         }
         await step("compose: service-name hosts sync") {
-            let names = ["davit-selftest-hosts-db", "davit-selftest-hosts-migrator"]
+            // admin is deliberately OUTSIDE migrator's dependency closure: a
+            // scoped up must still patch it (new migrator IP) and must not
+            // erase its entries from the others' managed blocks.
+            let names = ["davit-selftest-hosts-db", "davit-selftest-hosts-migrator",
+                         "davit-selftest-hosts-admin"]
             func cleanup() async {
                 for n in names { try? await ContainerService.delete(n, force: true) }
             }
@@ -1320,6 +1377,9 @@ enum SelfTest {
                 image: alpine:latest
                 command: ["sleep", "600"]
                 depends_on: [db]
+              admin:
+                image: alpine:latest
+                command: ["sleep", "600"]
             """, projectName: "ignored")
             func record(_ name: String) async throws -> ContainerRecord {
                 guard let r = try await ContainerService.listContainers().first(where: { $0.id == name }) else {
@@ -1342,14 +1402,16 @@ enum SelfTest {
                 return String(first)
             }
             do {
-                let upWarnings = try await Compose.up(plan: plan) { _, _ in }
-                guard upWarnings.isEmpty else {
-                    throw CLIError(command: "selftest", message: "hosts sync warned on alpine: \(upWarnings)")
+                let up = try await Compose.up(plan: plan) { _, _ in }
+                guard up.warnings.isEmpty else {
+                    throw CLIError(command: "selftest", message: "hosts sync warned on alpine: \(up.warnings)")
                 }
                 let dbIP = try await ip(names[0])
                 let migratorIP = try await ip(names[1])
+                let adminIP = try await ip(names[2])
                 guard try await resolved("db", in: names[1]) == dbIP,
-                      try await resolved("migrator", in: names[0]) == migratorIP
+                      try await resolved("migrator", in: names[0]) == migratorIP,
+                      try await resolved("admin", in: names[0]) == adminIP
                 else { throw CLIError(command: "selftest", message: "service names not cross-resolved after up") }
 
                 // The user scenario: recreate only the migrator. The selected up
@@ -1365,6 +1427,14 @@ enum SelfTest {
                 guard try await resolved("migrator", in: names[0]) == newIP,
                       try await resolved("db", in: names[1]) == dbIP
                 else { throw CLIError(command: "selftest", message: "hosts not re-synced after selected up") }
+                // The unselected admin: its entries survive in the others'
+                // blocks (the rewrite covers the whole project, not just the
+                // selection), it learns the new migrator IP, and the fresh
+                // migrator gets an admin entry too.
+                guard try await resolved("admin", in: names[0]) == adminIP,
+                      try await resolved("migrator", in: names[2]) == newIP,
+                      try await resolved("admin", in: names[1]) == adminIP
+                else { throw CLIError(command: "selftest", message: "unselected service's hosts entries lost after selected up") }
                 // The rewrite replaces, never accumulates: exactly one managed
                 // migrator line in db, carrying the new IP (old line gone).
                 let hosts = try await ContainerService.exec(names[0], ["cat", "/etc/hosts"]).stdoutString
@@ -1475,9 +1545,9 @@ enum SelfTest {
                 image: alpine:latest
                 command: ["/bin/sh", "-c", "echo davit-logs-beta; sleep 300"]
             """, projectName: "ignored")
-            func capture(services: [String] = [], tail: Int? = nil) async throws -> String {
+            func capture(services: [String] = [], tail: Int? = nil, skip: Set<String> = []) async throws -> String {
                 let sink = OutputLog()
-                try await Compose.logs(plan: plan, services: services, tail: tail) { sink.append($0) }
+                try await Compose.logs(plan: plan, services: services, tail: tail, skipBacklogFor: skip) { sink.append($0) }
                 return sink.text
             }
             do {
@@ -1504,6 +1574,13 @@ enum SelfTest {
                 guard tailed.contains("davit-selftest-logs-a  | davit-logs-alpha2"),
                       !tailed.contains("davit-logs-alpha1"), !tailed.contains("davit-logs-beta")
                 else { throw CLIError(command: "selftest", message: "tail/scope wrong: \(tailed.debugDescription)") }
+
+                // skipBacklogFor drops a service's backlog wholesale — up's
+                // attach passes its reused set so old runs don't replay.
+                let skipped = try await capture(skip: ["a"])
+                guard !skipped.contains("davit-logs-alpha1"), !skipped.contains("davit-logs-alpha2"),
+                      skipped.contains("davit-logs-beta")
+                else { throw CLIError(command: "selftest", message: "skipBacklogFor wrong: \(skipped.debugDescription)") }
                 do {
                     _ = try await capture(services: ["nope"])
                     throw CLIError(command: "selftest", message: "logs with unknown service not rejected")
@@ -1548,6 +1625,22 @@ enum SelfTest {
                     _ = try await Compose.runningContainer(plan: plan, service: "nope")
                     throw CLIError(command: "selftest", message: "exec with unknown service not rejected")
                 } catch Compose.Error.noSuchService("nope") { /* expected */ }
+
+                // Docker parity: naming a service scopes stop/start to EXACTLY
+                // it — the dependency stays up (a shared dep must not fall
+                // with one consumer), and the scoped start brings it back.
+                let scoped = try plan.selecting(services: ["two"], activeProfiles: [], includeDependencies: false)
+                guard scoped.services.map(\.service) == ["two"] else {
+                    throw CLIError(command: "selftest", message: "scoped selection wrong: \(scoped.services.map(\.service))")
+                }
+                try await Compose.stop(plan: scoped) { _, _ in }
+                guard try await running(names[0]) == true, try await running(names[1]) == false else {
+                    throw CLIError(command: "selftest", message: "scoped stop touched the dependency")
+                }
+                _ = try await Compose.start(plan: scoped) { _, _ in }
+                guard try await running(names[1]) == true else {
+                    throw CLIError(command: "selftest", message: "scoped start did not restart the service")
+                }
 
                 // stop: reverse dependency order; containers stay, ps shows stopped
                 let stopEvents = ProgressLog()

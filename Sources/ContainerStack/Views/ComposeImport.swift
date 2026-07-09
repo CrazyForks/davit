@@ -160,7 +160,7 @@ struct ComposeImportSheet: View {
         phase = .running("Starting…")
         Task {
             do {
-                let hostWarnings = try await Compose.up(plan: plan) { step, done in
+                let result = try await Compose.up(plan: plan) { step, done in
                     await MainActor.run {
                         if done {
                             // .waiting is transient — the checkmark grid only keys
@@ -177,7 +177,7 @@ struct ComposeImportSheet: View {
                         }
                     }
                 }
-                runtimeWarnings = hostWarnings
+                runtimeWarnings = result.warnings
                 phase = .done
                 await state.refreshAll()
             } catch {

@@ -204,9 +204,12 @@ enum ContainerService {
         let io = try ProcessIO.create(tty: container.configuration.initProcess.terminal, interactive: false, detach: true)
         do {
             let process = try await client.bootstrap(id: id, stdio: io.stdio, dynamicEnv: [:])
+            // Register BEFORE start: a fast one-shot can exit — and the
+            // apiserver reap its runtime client — before a wait issued
+            // afterwards lands, losing the exit code (see ComposeExitCodes).
+            if retainExitCode { await ComposeExitCodes.shared.register(id: id, process: process) }
             try await process.start()
             try io.closeAfterStart()
-            if retainExitCode { await ComposeExitCodes.shared.register(id: id, process: process) }
         } catch {
             try? io.close()
             try? await client.stop(id: id)

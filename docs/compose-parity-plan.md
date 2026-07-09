@@ -165,13 +165,20 @@ follow-up tasks F1/F2 below on user request, 2026-07-09.)
    topo `ContainerService.stop` with grace/signal options; start = topo
    `ContainerService.start` on existing containers; restart = stop then start;
    pull = `ContainerService.pullImage` per selected service image with progress lines.
+   Scoping (G5 revision, docker parity): naming services selects EXACTLY those — no
+   dependency closure — for stop/start/restart/pull and ps (`selecting(…,
+   includeDependencies: false)`); docker adds pull dependencies only with
+   `--include-deps`, and stopping a named service must not stop a dependency other
+   services still use. Empty selection keeps the all-enabled-services semantics.
 17. **exec:** `compose exec <service> <command...>` resolves the service's container
    name (must exist & be running → clear errors), then reuses the existing interactive
    exec path (Main.swift ExecMode) with the given argv — check whether ExecMode
    supports argv; extend minimally if it only opens a shell.
 18. **Remaining file keys:** `env_file:` (string / list / `{path, required}` map;
-   paths relative to compose dir; loaded with the existing dotenv parser; NO
-   interpolation of file contents (docker parity); precedence: `environment:` >
+   paths relative to compose dir; loaded with the existing dotenv parser; file
+   contents stay LITERAL — a deliberate deviation, G5-corrected: compose v2 does
+   expand `${VAR}` in env-file values (single-quoted ones excepted), ours never
+   does; precedence: `environment:` >
    `env_file:` entries, later files > earlier); `entrypoint:` (string → `--entrypoint`;
    list → first element as `--entrypoint`, remainder PREPENDED to the command argv —
    documented approximation of Apple's single-string entrypoint; empty → warning).
