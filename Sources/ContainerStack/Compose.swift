@@ -20,6 +20,8 @@ enum Compose {
         var profiles: [String]       // empty = always enabled
         var healthcheck: Healthcheck?
         var dependsOn: [String: DependsCondition]
+        var stopGracePeriod: Double? // seconds; nil = platform stop default
+        var stopSignal: String?      // signal name or number — the daemon parses it
         var id: String { service }
 
         /// Equivalent `container run …` (what Davit performs over XPC).
@@ -55,6 +57,8 @@ enum Compose {
         let project: String
         var volumes: [String]        // named volumes to create (missing ones only — caller filters)
         var networks: [String]       // networks to create
+        var externalVolumes: Set<String>   // declared `external:` — down leaves them alone
+        var externalNetworks: Set<String>
         var services: [ServicePlan]  // in dependency start order
         var warnings: [String]
     }
@@ -302,8 +306,18 @@ enum Compose {
         }
         let project = (root["name"] as? String) ?? projectName
 
-        let topVolumes = (root["volumes"] as? [String: Any]).map { Array($0.keys) } ?? []
-        let topNetworks = (root["networks"] as? [String: Any]).map { Array($0.keys) } ?? []
+        // Top-level declarations; `external: true` marks a resource someone else
+        // manages — down never deletes those (up still creates missing ones, a
+        // pre-existing divergence from docker's must-preexist rule).
+        func declared(_ key: String) -> (names: [String], external: Set<String>) {
+            guard let map = root[key] as? [String: Any] else { return ([], []) }
+            let external = map.compactMap { name, spec in
+                ((spec as? [String: Any])?["external"] as? Bool) == true ? name : nil
+            }
+            return (Array(map.keys), Set(external))
+        }
+        let (topVolumes, externalVolumes) = declared("volumes")
+        let (topNetworks, externalNetworks) = declared("networks")
 
         var plans: [String: ServicePlan] = [:]
         for (svcName, svcAny) in services {
@@ -336,6 +350,8 @@ enum Compose {
             project: project,
             volumes: topVolumes.sorted(),
             networks: topNetworks.sorted(),
+            externalVolumes: externalVolumes,
+            externalNetworks: externalNetworks,
             services: ordered.compactMap { plans[$0] },
             warnings: warnings
         )
@@ -518,11 +534,22 @@ enum Compose {
         default: warnings.append("\(key): unrecognized healthcheck format — ignored")
         }
 
+        // stop_grace_period / stop_signal: applied by down/stop, not at run time
+        var stopGrace: Double? = nil
+        if let raw = svc["stop_grace_period"] {
+            if let seconds = parseDuration(scalarString(raw)) {
+                stopGrace = seconds
+            } else {
+                warnings.append("\(key): stop_grace_period \"\(scalarString(raw))\" is not a duration — using the default")
+            }
+        }
+        let stopSignal = svc["stop_signal"].map(scalarString)
+
         // Everything we understand is handled above; name the rest honestly.
         let handled: Set<String> = [
             "image", "container_name", "environment", "user", "working_dir", "ports",
             "volumes", "networks", "cpus", "mem_limit", "deploy", "command", "depends_on",
-            "profiles", "healthcheck",
+            "profiles", "healthcheck", "stop_grace_period", "stop_signal",
         ]
         for k in svc.keys.sorted() where !handled.contains(k) {
             warnings.append("\(key): \"\(k)\" is not supported — ignored")
@@ -532,7 +559,8 @@ enum Compose {
             service: key, name: name, image: image,
             processArgs: process, managementArgs: management,
             resourceArgs: resource, commandArgs: command,
-            profiles: profiles, healthcheck: healthcheck, dependsOn: deps)
+            profiles: profiles, healthcheck: healthcheck, dependsOn: deps,
+            stopGracePeriod: stopGrace, stopSignal: stopSignal)
         return (plan, warnings)
     }
 
@@ -719,6 +747,8 @@ extension Compose.Plan {
             project: project,
             volumes: volumes.filter(volumeRefs.contains),
             networks: networks.filter(networkRefs.contains),
+            externalVolumes: externalVolumes,
+            externalNetworks: externalNetworks,
             services: kept,
             warnings: warnings)
     }
@@ -865,6 +895,93 @@ extension Compose {
                 retainExitCode: needsExitCode.contains(svc.service)
             )
             await progress(.service(svc.service), true)
+        }
+    }
+
+    /// Tear the plan down: stop each existing container in reverse dependency
+    /// order — honoring stop_grace_period / stop_signal — then force-delete it.
+    /// Naming `services` scopes the teardown to exactly those (no dependency
+    /// closure: deleting a dependency out from under the services still using
+    /// it would surprise); only a FULL project down also deletes the declared
+    /// non-external networks and, with `removeVolumes`, the declared
+    /// non-external volumes. Missing containers skip silently, so down is
+    /// idempotent. Returns warnings (e.g. a network still in use elsewhere).
+    static func down(
+        plan: Plan,
+        services requested: [String] = [],
+        removeVolumes: Bool = false,
+        progress: @escaping @Sendable (StepKind, _ done: Bool) async -> Void
+    ) async throws -> [String] {
+        let known = Set(plan.services.map(\.service))
+        for name in requested where !known.contains(name) { throw Error.noSuchService(name) }
+        let selected = requested.isEmpty ? known : Set(requested)
+        var warnings: [String] = []
+
+        let existing = Dictionary(uniqueKeysWithValues:
+            try await ContainerService.listContainers().map { ($0.id, $0.isRunning) })
+        for svc in plan.services.reversed() where selected.contains(svc.service) {
+            guard let running = existing[svc.name] else { continue }  // never created
+            await progress(.service(svc.service), false)
+            if running {
+                // Unset grace = the platform's stop default (5s, SIGTERM),
+                // same as the app's Stop button. Clamped: a day is plenty.
+                let grace = Int32(min(svc.stopGracePeriod ?? 5, 86_400).rounded())
+                try await ContainerService.stop(svc.name, timeoutSeconds: grace, signal: svc.stopSignal)
+            }
+            try await ContainerService.delete(svc.name, force: true)
+            await progress(.service(svc.service), true)
+        }
+
+        // Networks and volumes only fall with the whole project: a service-
+        // scoped down must not pull shared infrastructure from under the rest.
+        guard requested.isEmpty else { return warnings }
+
+        let networks = Set((try? await ContainerService.listNetworks())?.map(\.name) ?? [])
+        for network in plan.networks where !plan.externalNetworks.contains(network) && networks.contains(network) {
+            await progress(.network(network), false)
+            do {
+                try await ContainerService.deleteNetwork(network)
+                await progress(.network(network), true)
+            } catch {
+                warnings.append("network \(network) not removed — still in use")
+            }
+        }
+        if removeVolumes {
+            let volumes = Set((try? await ContainerService.listVolumes())?.map(\.name) ?? [])
+            for volume in plan.volumes where !plan.externalVolumes.contains(volume) && volumes.contains(volume) {
+                await progress(.volume(volume), false)
+                do {
+                    try await ContainerService.deleteVolume(volume)
+                    await progress(.volume(volume), true)
+                } catch {
+                    warnings.append("volume \(volume) not removed — still in use")
+                }
+            }
+        }
+        return warnings
+    }
+
+    /// Printable `compose ps` row — the CLI aligns these into columns.
+    struct PSRecord: Hashable {
+        let service: String
+        let container: String
+        let state: String
+        let ports: String
+    }
+
+    /// Live status per plan service, matched by the plan's container names:
+    /// existing containers only, running or not — never-created services are
+    /// omitted (docker parity).
+    static func ps(plan: Plan) async throws -> [PSRecord] {
+        let byId = Dictionary(uniqueKeysWithValues: try await ContainerService.listContainers().map { ($0.id, $0) })
+        return plan.services.compactMap { svc in
+            guard let record = byId[svc.name] else { return nil }
+            let ports = (record.configuration.publishedPorts ?? []).map {
+                "\($0.hostAddress ?? "0.0.0.0"):\($0.hostPort ?? 0)->\($0.containerPort ?? 0)/\($0.proto ?? "tcp")"
+            }
+            return PSRecord(
+                service: svc.service, container: svc.name, state: record.state.rawValue,
+                ports: ports.isEmpty ? "-" : ports.joined(separator: ", "))
         }
     }
 

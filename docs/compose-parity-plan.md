@@ -237,7 +237,7 @@ follow-up tasks F1/F2 below on user request, 2026-07-09.)
   stopped name-colliding container before a fresh up → recreated cleanly. defer
   cleanup. Done when: build + full selftest OK. Commit:
   `compose: idempotent up (reuse running, recreate stopped)`.
-- [ ] **G1 — CLI refactor + down + ps.** Decisions 12/13/14 (+ parse
+- [x] **G1 — CLI refactor + down + ps.** Decisions 12/13/14 (+ parse
   `stop_grace_period`/`stop_signal` keys used by down). Pure selftest: new-key parsing.
   Live selftest: up 2-service fixture w/ declared network+volume → ps lists both
   running → down (no args) removes containers + declared network, volume KEPT →

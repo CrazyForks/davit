@@ -214,8 +214,12 @@ enum ContainerService {
         }
     }
 
-    static func stop(_ id: String) async throws {
-        try await ContainerClient().stop(id: id)
+    /// Defaults mirror the platform's stop options (5s grace, SIGTERM).
+    /// Compose down passes stop_grace_period / stop_signal through here; the
+    /// signal is a name or number ("SIGUSR1", "USR1", "10") parsed daemon-side.
+    static func stop(_ id: String, timeoutSeconds: Int32 = 5, signal: String? = nil) async throws {
+        try await ContainerClient().stop(
+            id: id, opts: ContainerStopOptions(timeoutInSeconds: timeoutSeconds, signal: signal))
     }
 
     static func kill(_ id: String) async throws {

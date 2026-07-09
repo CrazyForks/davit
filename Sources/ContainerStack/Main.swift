@@ -223,92 +223,8 @@ enum Main {
             return
         }
         if args.count >= 2, args[1] == "compose" {
-            // usage: compose plan|up [-f <file>] [--env-file <path>] [--profile <name>]... [service...]
-            // plan parses + prints (no side effects); up also creates volumes/networks
-            // and starts services. Without -f the file is autodiscovered like docker;
-            // naming services selects them plus their depends_on closure. ${VAR}
-            // interpolation reads the file's sibling .env unless --env-file overrides.
-            let usage = "usage: compose plan|up [-f <file>] [--env-file <path>] [--profile <name>]... [service...]\n"
-            guard args.count >= 3, args[2] == "plan" || args[2] == "up" else {
-                FileHandle.standardError.write(Data(usage.utf8)); exit(2)
-            }
-            let sub = args[2]
-            var file: String?, envFile: String?, profiles: [String] = [], serviceNames: [String] = []
-            let hasFileFlag = args.contains("-f") || args.contains("--file")
-            var i = 3
-            while i < args.count {
-                switch args[i] {
-                case "-f", "--file":
-                    guard i + 1 < args.count else { FileHandle.standardError.write(Data(usage.utf8)); exit(2) }
-                    file = (args[i + 1] as NSString).expandingTildeInPath; i += 1
-                case "--env-file":
-                    guard i + 1 < args.count else { FileHandle.standardError.write(Data(usage.utf8)); exit(2) }
-                    envFile = (args[i + 1] as NSString).expandingTildeInPath; i += 1
-                case "--profile":
-                    guard i + 1 < args.count else { FileHandle.standardError.write(Data(usage.utf8)); exit(2) }
-                    profiles.append(args[i + 1]); i += 1
-                default:
-                    guard !args[i].hasPrefix("-") else {
-                        FileHandle.standardError.write(Data("unknown flag: \(args[i])\n\(usage)".utf8)); exit(2)
-                    }
-                    // Legacy `compose plan|up <file>`: the first positional is the
-                    // file iff no -f was given and it looks like a path; path-like
-                    // but missing is a friendlier error than "no such service".
-                    let expanded = (args[i] as NSString).expandingTildeInPath
-                    if file == nil, serviceNames.isEmpty, !hasFileFlag,
-                       args[i].contains("/") || args[i].hasSuffix(".yml") || args[i].hasSuffix(".yaml") {
-                        guard FileManager.default.fileExists(atPath: expanded) else {
-                            FileHandle.standardError.write(Data("compose file not found: \(args[i])\n".utf8)); exit(1)
-                        }
-                        file = expanded
-                    } else {
-                        serviceNames.append(args[i])
-                    }
-                }
-                i += 1
-            }
-            // COMPOSE_PROFILES is the fallback when no --profile was given (docker v2).
-            if profiles.isEmpty, let env = ProcessInfo.processInfo.environment["COMPOSE_PROFILES"] {
-                profiles = env.split(separator: ",").map(String.init).filter { !$0.isEmpty }
-            }
-            let discovered = file == nil ? Compose.discoverFile(startingAt: FileManager.default.currentDirectoryPath) : nil
-            guard let path = file ?? discovered?.path else {
-                FileHandle.standardError.write(Data("no compose file found (looked for compose.yaml, compose.yml, docker-compose.yml, docker-compose.yaml in this and parent directories)\n".utf8)); exit(1)
-            }
-            let autodiscovered = file == nil
-            let discoveryWarning = discovered?.warning
-            let requested = serviceNames
-            let activeProfiles = profiles
-            let envFilePath = envFile
-            let semaphore = DispatchSemaphore(value: 0)
-            Task.detached {
-                do {
-                    let text = try String(contentsOfFile: path, encoding: .utf8)
-                    let dir = URL(fileURLWithPath: path).deletingLastPathComponent()
-                    let environment = try Compose.effectiveEnvironment(composeDir: dir.path, envFile: envFilePath)
-                    let plan = try Compose.parse(
-                        text: text, projectName: dir.lastPathComponent, baseDir: dir.path, environment: environment)
-                        .selecting(services: requested, activeProfiles: activeProfiles)
-                    if autodiscovered { print("file: \(path)") }
-                    print("project: \(plan.project)")
-                    for v in plan.volumes { print("volume: \(v)") }
-                    for n in plan.networks { print("network: \(n)") }
-                    for s in plan.services { print("service: \(s.service)\n  \(s.cliPreview)") }
-                    if let w = discoveryWarning { print("warning: \(w)") }
-                    for w in plan.warnings { print("warning: \(w)") }
-                    if sub == "up" {
-                        try await Compose.up(plan: plan) { step, done in
-                            if done { print("up: \(step.label) done") }
-                        }
-                        print("compose up: ok")
-                    }
-                    exit(0)
-                } catch {
-                    let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
-                    FileHandle.standardError.write(Data("compose \(sub) failed: \(message)\n".utf8)); exit(1)
-                }
-            }
-            semaphore.wait()
+            // Shared parse + dispatch for every compose subcommand — ComposeCLI below.
+            ComposeCLI.run(Array(args.dropFirst(2)))
             return
         }
         if args.count >= 3, args[1] == "platform", args[2] == "install" || args[2] == "remove" {
@@ -390,6 +306,174 @@ enum Main {
             return
         }
         ContainerStackApp.main()
+    }
+}
+
+/// `davit compose <sub>` — shared CLI plumbing for every compose subcommand
+/// (plan decision 12): one argv parser covering the common flags, per-
+/// subcommand extras, and the file-vs-service positional rule, plus the
+/// autodiscovery and .env handling, all in one place. Without a file the
+/// compose file is autodiscovered like docker; naming services scopes the
+/// command; ${VAR} interpolation reads the file's sibling .env unless
+/// --env-file overrides. Usage problems exit 2, runtime failures exit 1.
+enum ComposeCLI {
+    static let usage = """
+    usage: compose <subcommand> [-f <file>] [--env-file <path>] [--profile <name>]... [service...]
+      subcommands: plan | up [-d|--detach] | down [-v|--volumes] | ps
+                   logs [-f|--follow] [--tail <n>] | stop | start | restart | pull
+                   exec <service> <command...>
+    """
+
+    struct Invocation {
+        var subcommand: String
+        var file: String? = nil
+        var envFile: String? = nil
+        var profiles: [String] = []
+        var flags: Set<String> = []      // canonical bool flags: "detach", "volumes", "follow"
+        var counts: [String: Int] = [:]  // canonical int flags: "tail"
+        var services: [String] = []
+    }
+
+    /// Implemented subcommands; the remaining decision-12 ones land in later
+    /// rounds by adding their name here and a case in run().
+    private static let subcommands: Set<String> = ["plan", "up", "down", "ps"]
+
+    /// Per-subcommand flags, token → canonical name. These shadow the shared
+    /// flags: for `logs`, -f means --follow, so its file flag is `--file` only.
+    private static let boolFlags: [String: [String: String]] = [
+        "up": ["-d": "detach", "--detach": "detach"],
+        "down": ["-v": "volumes", "--volumes": "volumes"],
+        "logs": ["-f": "follow", "--follow": "follow"],
+    ]
+    private static let intFlags: [String: [String: String]] = [
+        "logs": ["--tail": "tail"]
+    ]
+
+    /// args = everything after "compose". Exits on usage errors (2) and on a
+    /// path-like positional that doesn't exist (1) — runs before any async work.
+    static func parse(_ args: [String]) -> Invocation {
+        func usageExit() -> Never {
+            FileHandle.standardError.write(Data((usage + "\n").utf8)); exit(2)
+        }
+        guard let sub = args.first, subcommands.contains(sub) else { usageExit() }
+        var inv = Invocation(subcommand: sub)
+        let bools = boolFlags[sub] ?? [:]
+        let ints = intFlags[sub] ?? [:]
+        let fileTokens = ["-f", "--file"].filter { bools[$0] == nil && ints[$0] == nil }
+        // The file flag may follow a positional (`up web -f x.yml`), so the
+        // positional rule below needs to know about it up front.
+        let hasFileFlag = args.contains(where: fileTokens.contains)
+        var i = 1
+        while i < args.count {
+            let arg = args[i]
+            if let name = bools[arg] {
+                inv.flags.insert(name)
+            } else if let name = ints[arg] {
+                guard i + 1 < args.count, let n = Int(args[i + 1]) else { usageExit() }
+                inv.counts[name] = n; i += 1
+            } else if fileTokens.contains(arg) {
+                guard i + 1 < args.count else { usageExit() }
+                inv.file = (args[i + 1] as NSString).expandingTildeInPath; i += 1
+            } else if arg == "--env-file" {
+                guard i + 1 < args.count else { usageExit() }
+                inv.envFile = (args[i + 1] as NSString).expandingTildeInPath; i += 1
+            } else if arg == "--profile" {
+                guard i + 1 < args.count else { usageExit() }
+                inv.profiles.append(args[i + 1]); i += 1
+            } else if arg.hasPrefix("-") {
+                FileHandle.standardError.write(Data("unknown flag: \(arg)\n\(usage)\n".utf8)); exit(2)
+            } else {
+                // Legacy `compose <sub> <file>`: the first positional is the
+                // file iff no file flag was given and it looks like a path;
+                // path-like but missing is a friendlier error than "no such
+                // service".
+                let expanded = (arg as NSString).expandingTildeInPath
+                if inv.file == nil, inv.services.isEmpty, !hasFileFlag,
+                   arg.contains("/") || arg.hasSuffix(".yml") || arg.hasSuffix(".yaml") {
+                    guard FileManager.default.fileExists(atPath: expanded) else {
+                        FileHandle.standardError.write(Data("compose file not found: \(arg)\n".utf8)); exit(1)
+                    }
+                    inv.file = expanded
+                } else {
+                    inv.services.append(arg)
+                }
+            }
+            i += 1
+        }
+        // COMPOSE_PROFILES is the fallback when no --profile was given (docker v2).
+        if inv.profiles.isEmpty, let env = ProcessInfo.processInfo.environment["COMPOSE_PROFILES"] {
+            inv.profiles = env.split(separator: ",").map(String.init).filter { !$0.isEmpty }
+        }
+        return inv
+    }
+
+    static func run(_ args: [String]) {
+        let inv = parse(args)
+        let discovered = inv.file == nil
+            ? Compose.discoverFile(startingAt: FileManager.default.currentDirectoryPath) : nil
+        guard let path = inv.file ?? discovered?.path else {
+            FileHandle.standardError.write(Data("no compose file found (looked for compose.yaml, compose.yml, docker-compose.yml, docker-compose.yaml in this and parent directories)\n".utf8)); exit(1)
+        }
+        let autodiscovered = inv.file == nil
+        let discoveryWarning = discovered?.warning
+        let semaphore = DispatchSemaphore(value: 0)
+        Task.detached {
+            do {
+                let text = try String(contentsOfFile: path, encoding: .utf8)
+                let dir = URL(fileURLWithPath: path).deletingLastPathComponent()
+                let environment = try Compose.effectiveEnvironment(composeDir: dir.path, envFile: inv.envFile)
+                let parsed = try Compose.parse(
+                    text: text, projectName: dir.lastPathComponent, baseDir: dir.path, environment: environment)
+                switch inv.subcommand {
+                case "plan", "up":
+                    let plan = try parsed.selecting(services: inv.services, activeProfiles: inv.profiles)
+                    if autodiscovered { print("file: \(path)") }
+                    print("project: \(plan.project)")
+                    for v in plan.volumes { print("volume: \(v)") }
+                    for n in plan.networks { print("network: \(n)") }
+                    for s in plan.services { print("service: \(s.service)\n  \(s.cliPreview)") }
+                    if let w = discoveryWarning { print("warning: \(w)") }
+                    for w in plan.warnings { print("warning: \(w)") }
+                    if inv.subcommand == "up" {
+                        // -d/--detach parses; up already returns after starting
+                        // (attached logs arrive with the logs subcommand).
+                        try await Compose.up(plan: plan) { step, done in
+                            if done { print("up: \(step.label) done") }
+                        }
+                        print("compose up: ok")
+                    }
+                case "down":
+                    // The whole file, every profile active: teardown must not
+                    // strand profile-gated containers (decision 13).
+                    let warnings = try await Compose.down(
+                        plan: parsed, services: inv.services,
+                        removeVolumes: inv.flags.contains("volumes")
+                    ) { step, done in
+                        if done { print("down: \(step.label) done") }
+                    }
+                    for w in warnings { print("warning: \(w)") }
+                    print("compose down: ok")
+                case "ps":
+                    let plan = try parsed.selecting(services: inv.services, activeProfiles: inv.profiles)
+                    let records = try await Compose.ps(plan: plan)
+                    let rows = [["SERVICE", "CONTAINER", "STATE", "PORTS"]]
+                        + records.map { [$0.service, $0.container, $0.state, $0.ports] }
+                    let widths = (0..<4).map { c in rows.map { $0[c].count }.max() ?? 0 }
+                    for row in rows {
+                        print(row.enumerated()
+                            .map { $0 == 3 ? $1 : $1.padding(toLength: widths[$0], withPad: " ", startingAt: 0) }
+                            .joined(separator: "  "))
+                    }
+                default:
+                    FileHandle.standardError.write(Data((usage + "\n").utf8)); exit(2)  // parse() keeps this unreachable
+                }
+                exit(0)
+            } catch {
+                let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+                FileHandle.standardError.write(Data("compose \(inv.subcommand) failed: \(message)\n".utf8)); exit(1)
+            }
+        }
+        semaphore.wait()
     }
 }
 
@@ -868,6 +952,39 @@ enum SelfTest {
                                     projectName: "q", environment: ["EMPTY": ""]).services[0].image == "xy"
             else { throw CLIError(command: "selftest", message: "? should accept a set-but-empty variable") }
         }
+        await step("compose: stop keys + external declarations") {
+            let yaml = """
+            services:
+              a:
+                image: x
+                stop_grace_period: 1m30s
+                stop_signal: SIGUSR1
+              b:
+                image: y
+                stop_grace_period: soonish
+            volumes:
+              keep: { external: true }
+              mine:
+            networks:
+              theirs: { external: true }
+              ours:
+            """
+            let plan = try Compose.parse(text: yaml, projectName: "stops")
+            let a = plan.services.first { $0.service == "a" }!
+            let b = plan.services.first { $0.service == "b" }!
+            guard a.stopGracePeriod == 90, a.stopSignal == "SIGUSR1" else {
+                throw CLIError(command: "selftest", message: "stop keys wrong: \(String(describing: a.stopGracePeriod)) \(String(describing: a.stopSignal))")
+            }
+            // Unparsable grace falls back to the default with a warning; the new
+            // keys must not surface as "not supported". Only one warning expected.
+            guard b.stopGracePeriod == nil, b.stopSignal == nil,
+                  plan.warnings.count == 1,
+                  plan.warnings[0].contains("stop_grace_period"), plan.warnings[0].contains("not a duration")
+            else { throw CLIError(command: "selftest", message: "stop-key warnings wrong: \(plan.warnings)") }
+            guard plan.volumes == ["keep", "mine"], plan.externalVolumes == ["keep"],
+                  plan.networks == ["ours", "theirs"], plan.externalNetworks == ["theirs"]
+            else { throw CLIError(command: "selftest", message: "external declarations wrong: \(plan.volumes) \(plan.externalVolumes) \(plan.networks) \(plan.externalNetworks)") }
+        }
         await step("compose: up with depends_on conditions") {
             let containers = ["davit-selftest-compose-db", "davit-selftest-compose-init",
                               "davit-selftest-compose-web", "davit-selftest-composef-bad",
@@ -1049,6 +1166,86 @@ enum SelfTest {
                 guard a4.isRunning, a4.configuration.creationDate != pre.configuration.creationDate else {
                     throw CLIError(command: "selftest", message: "colliding stopped container was not recreated")
                 }
+            } catch {
+                await cleanup()
+                throw error
+            }
+            await cleanup()
+        }
+        await step("compose: up → ps → down") {
+            let names = ["davit-selftest-updown-one", "davit-selftest-updown-two"]
+            func cleanup() async {
+                for n in names { try? await ContainerService.delete(n, force: true) }
+                try? await ContainerService.deleteNetwork("davit-selftest-updown-net")
+                try? await ContainerService.deleteVolume("davit-selftest-updown-vol")
+            }
+            await cleanup()  // leftovers from a previous aborted run
+
+            let plan = try Compose.parse(text: """
+            name: davit-selftest-updown
+            services:
+              one:
+                image: alpine:latest
+                command: ["sleep", "300"]
+                volumes: [davit-selftest-updown-vol:/data]
+                networks: [davit-selftest-updown-net]
+              two:
+                image: alpine:latest
+                command: ["sleep", "300"]
+                depends_on: [one]
+            volumes: { davit-selftest-updown-vol: }
+            networks: { davit-selftest-updown-net: }
+            """, projectName: "ignored")
+            func haveNetwork() async throws -> Bool {
+                try await ContainerService.listNetworks().map(\.name).contains("davit-selftest-updown-net")
+            }
+            func haveVolume() async throws -> Bool {
+                try await ContainerService.listVolumes().map(\.name).contains("davit-selftest-updown-vol")
+            }
+            do {
+                try await Compose.up(plan: plan) { _, _ in }
+                let rows = try await Compose.ps(plan: plan)
+                guard rows.map(\.service) == ["one", "two"],
+                      rows.map(\.container) == names,
+                      rows.allSatisfy({ $0.state == "running" })
+                else { throw CLIError(command: "selftest", message: "ps after up wrong: \(rows)") }
+
+                // Service-scoped down: exactly that container falls; the declared
+                // network and volume (and the other service) stay untouched.
+                let scoped = try await Compose.down(plan: plan, services: ["two"]) { _, _ in }
+                guard scoped.isEmpty, try await Compose.ps(plan: plan).map(\.service) == ["one"],
+                      try await haveNetwork(), try await haveVolume()
+                else { throw CLIError(command: "selftest", message: "scoped down removed too much") }
+                do {
+                    _ = try await Compose.down(plan: plan, services: ["nope"]) { _, _ in }
+                    throw CLIError(command: "selftest", message: "down with unknown service not rejected")
+                } catch Compose.Error.noSuchService("nope") { /* expected */ }
+
+                // Full down (reusing one, recreating two first): containers gone in
+                // reverse dependency order, declared network gone, volume KEPT.
+                try await Compose.up(plan: plan) { _, _ in }
+                let events = ProgressLog()
+                _ = try await Compose.down(plan: plan) { events.append($0, $1) }
+                let seen = events.all
+                guard let twoDone = seen.firstIndex(where: { $0.0 == .service("two") && $0.1 }),
+                      let oneDone = seen.firstIndex(where: { $0.0 == .service("one") && $0.1 }),
+                      twoDone < oneDone
+                else { throw CLIError(command: "selftest", message: "down order wrong: \(seen)") }
+                guard try await Compose.ps(plan: plan).isEmpty,
+                      try await !haveNetwork(), try await haveVolume()
+                else { throw CLIError(command: "selftest", message: "full down should remove containers + network, keep the volume") }
+
+                // Idempotent: a second down finds nothing and stays silent.
+                guard try await Compose.down(plan: plan, progress: { _, _ in }).isEmpty else {
+                    throw CLIError(command: "selftest", message: "second down should be a warning-free no-op")
+                }
+
+                // down -v also removes the declared volume.
+                try await Compose.up(plan: plan) { _, _ in }
+                _ = try await Compose.down(plan: plan, removeVolumes: true) { _, _ in }
+                guard try await Compose.ps(plan: plan).isEmpty,
+                      try await !haveNetwork(), try await !haveVolume()
+                else { throw CLIError(command: "selftest", message: "down -v should remove the declared volume too") }
             } catch {
                 await cleanup()
                 throw error
