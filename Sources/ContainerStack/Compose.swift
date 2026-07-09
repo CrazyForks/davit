@@ -90,6 +90,40 @@ enum Compose {
         }
     }
 
+    // MARK: discovery
+
+    /// Docker-style compose file autodiscovery. `COMPOSE_FILE` (single path,
+    /// absolute or relative to `dir`) wins and is trusted as-is — a bad path
+    /// surfaces when the file is read. Otherwise each directory from `dir` up
+    /// to / is tried for the candidate names in docker's order; when both
+    /// compose.yaml and compose.yml exist in the winning directory,
+    /// compose.yaml wins with a warning (docker parity).
+    static func discoverFile(
+        startingAt dir: String,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> (path: String, warning: String?)? {
+        if let override = environment["COMPOSE_FILE"], !override.isEmpty {
+            let expanded = (override as NSString).expandingTildeInPath
+            let path = expanded.hasPrefix("/")
+                ? expanded
+                : URL(fileURLWithPath: dir).appendingPathComponent(expanded).standardizedFileURL.path
+            return (path, nil)
+        }
+        let candidates = ["compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"]
+        var url = URL(fileURLWithPath: dir).standardizedFileURL
+        while true {
+            let present = candidates.filter { FileManager.default.fileExists(atPath: url.appendingPathComponent($0).path) }
+            if let winner = present.first {
+                let warning = present.contains("compose.yaml") && present.contains("compose.yml")
+                    ? "both compose.yaml and compose.yml exist in \(url.path) — using compose.yaml"
+                    : nil
+                return (url.appendingPathComponent(winner).path, warning)
+            }
+            if url.path == "/" { return nil }
+            url.deleteLastPathComponent()
+        }
+    }
+
     // MARK: parse
 
     static func parse(text: String, projectName: String, baseDir: String? = nil) throws -> Plan {

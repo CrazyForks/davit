@@ -223,23 +223,59 @@ enum Main {
             return
         }
         if args.count >= 2, args[1] == "compose" {
-            // usage: compose plan <file>   (parse + print, no side effects)
-            //        compose up <file>     (create volumes/networks, run services)
-            guard args.count >= 4, args[2] == "plan" || args[2] == "up" else {
-                FileHandle.standardError.write(Data("usage: compose plan|up <file>\n".utf8)); exit(2)
+            // usage: compose plan|up [-f <file>] [--profile <name>]... [service...]
+            // plan parses + prints (no side effects); up also creates volumes/networks
+            // and starts services. Without -f the file is autodiscovered like docker;
+            // naming services selects them plus their depends_on closure.
+            guard args.count >= 3, args[2] == "plan" || args[2] == "up" else {
+                FileHandle.standardError.write(Data("usage: compose plan|up [-f <file>] [--profile <name>]... [service...]\n".utf8)); exit(2)
             }
             let sub = args[2]
-            let path = (args[3] as NSString).expandingTildeInPath
+            var file: String?, profiles: [String] = [], serviceNames: [String] = []
+            let hasFileFlag = args.contains("-f") || args.contains("--file")
+            var i = 3
+            while i < args.count {
+                switch args[i] {
+                case "-f", "--file": if i + 1 < args.count { file = (args[i + 1] as NSString).expandingTildeInPath; i += 1 }
+                case "--profile": if i + 1 < args.count { profiles.append(args[i + 1]); i += 1 }
+                default:
+                    // Legacy `compose plan|up <file>`: the first positional is the
+                    // file iff no -f was given, it looks like a path, and it exists.
+                    let expanded = (args[i] as NSString).expandingTildeInPath
+                    if file == nil, serviceNames.isEmpty, !hasFileFlag,
+                       args[i].contains("/") || args[i].hasSuffix(".yml") || args[i].hasSuffix(".yaml"),
+                       FileManager.default.fileExists(atPath: expanded) {
+                        file = expanded
+                    } else {
+                        serviceNames.append(args[i])
+                    }
+                }
+                i += 1
+            }
+            if let env = ProcessInfo.processInfo.environment["COMPOSE_PROFILES"] {
+                profiles += env.split(separator: ",").map(String.init).filter { !$0.isEmpty }
+            }
+            let discovered = file == nil ? Compose.discoverFile(startingAt: FileManager.default.currentDirectoryPath) : nil
+            guard let path = file ?? discovered?.path else {
+                FileHandle.standardError.write(Data("no compose file found (looked for compose.yaml, compose.yml, docker-compose.yaml, docker-compose.yml in this and parent directories)\n".utf8)); exit(1)
+            }
+            let autodiscovered = file == nil
+            let discoveryWarning = discovered?.warning
+            let requested = serviceNames
+            let activeProfiles = profiles
             let semaphore = DispatchSemaphore(value: 0)
             Task.detached {
                 do {
                     let text = try String(contentsOfFile: path, encoding: .utf8)
                     let dir = URL(fileURLWithPath: path).deletingLastPathComponent()
                     let plan = try Compose.parse(text: text, projectName: dir.lastPathComponent, baseDir: dir.path)
+                        .selecting(services: requested, activeProfiles: activeProfiles)
+                    if autodiscovered { print("file: \(path)") }
                     print("project: \(plan.project)")
                     for v in plan.volumes { print("volume: \(v)") }
                     for n in plan.networks { print("network: \(n)") }
                     for s in plan.services { print("service: \(s.service)\n  \(s.cliPreview)") }
+                    if let w = discoveryWarning { print("warning: \(w)") }
                     for w in plan.warnings { print("warning: \(w)") }
                     if sub == "up" {
                         try await Compose.up(plan: plan) { step, done in
@@ -637,6 +673,47 @@ enum SelfTest {
             guard try gated.selecting(services: ["a"], activeProfiles: ["p"]).services.map(\.service) == ["g", "a"] else {
                 throw CLIError(command: "selftest", message: "--profile p should unlock the gated dependency")
             }
+        }
+        await step("compose: file autodiscovery") {
+            let fm = FileManager.default
+            let root = fm.temporaryDirectory.appendingPathComponent("davit-selftest-discover-\(UUID().uuidString)")
+            let nested = root.appendingPathComponent("sub/dir")
+            try fm.createDirectory(at: nested, withIntermediateDirectories: true)
+            defer { try? fm.removeItem(at: root) }
+            func write(_ name: String, in dir: URL) throws {
+                try "services: {}\n".write(to: dir.appendingPathComponent(name), atomically: true, encoding: .utf8)
+            }
+
+            if let stray = Compose.discoverFile(startingAt: nested.path, environment: [:]) {
+                throw CLIError(command: "selftest", message: "unexpected compose file in empty tree: \(stray.path)")
+            }
+            // lowest-priority candidate name, in a parent directory, is still found
+            try write("docker-compose.yml", in: root)
+            guard let parent = Compose.discoverFile(startingAt: nested.path, environment: [:]),
+                  parent.path == root.appendingPathComponent("docker-compose.yml").path, parent.warning == nil
+            else { throw CLIError(command: "selftest", message: "parent docker-compose.yml not discovered") }
+            // candidate order within one directory: docker-compose.yaml beats .yml
+            try write("docker-compose.yaml", in: root)
+            guard Compose.discoverFile(startingAt: nested.path, environment: [:])?.path
+                == root.appendingPathComponent("docker-compose.yaml").path
+            else { throw CLIError(command: "selftest", message: "docker-compose.yaml should beat docker-compose.yml") }
+            // the nearest directory wins over any parent
+            try write("compose.yml", in: nested)
+            guard Compose.discoverFile(startingAt: nested.path, environment: [:])?.path
+                == nested.appendingPathComponent("compose.yml").path
+            else { throw CLIError(command: "selftest", message: "nested compose.yml should beat parent files") }
+            // both compose.yaml + compose.yml → compose.yaml wins, with a warning
+            try write("compose.yaml", in: nested)
+            guard let both = Compose.discoverFile(startingAt: nested.path, environment: [:]),
+                  both.path == nested.appendingPathComponent("compose.yaml").path,
+                  both.warning?.contains("both compose.yaml and compose.yml") == true
+            else { throw CLIError(command: "selftest", message: "both-yaml warning missing") }
+            // COMPOSE_FILE overrides discovery: absolute, or relative to the start dir
+            let absolute = root.appendingPathComponent("custom.yaml").path
+            guard Compose.discoverFile(startingAt: nested.path, environment: ["COMPOSE_FILE": absolute])?.path == absolute,
+                  Compose.discoverFile(startingAt: nested.path, environment: ["COMPOSE_FILE": "custom.yaml"])?.path
+                      == nested.appendingPathComponent("custom.yaml").path
+            else { throw CLIError(command: "selftest", message: "COMPOSE_FILE override not honored") }
         }
         await step("compose: up with depends_on conditions") {
             let containers = ["davit-selftest-compose-db", "davit-selftest-compose-init",

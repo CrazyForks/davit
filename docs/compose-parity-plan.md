@@ -133,7 +133,7 @@ follow-up; do not creep.
   steps for both conditions. Failure path: mini-fixture w/ healthcheck `["CMD","false"]`
   retries 2 interval 1s → up throws. defer: force-delete all fixture containers +
   volumes. Done when: build + full selftest OK. Commit: `compose: honor depends_on conditions with healthchecks`.
-- [ ] **E4 — CLI: autodiscovery + selection + profiles (Main.swift + README).**
+- [x] **E4 — CLI: autodiscovery + selection + profiles (Main.swift + README).**
   Rewrite compose dispatch per decisions 1+2 (manual flag loop in build-mode style;
   usage string `usage: compose plan|up [-f <file>] [--profile <name>]... [service...]`).
   Autodiscovery helper in Compose.swift (`Compose.discoverFile(from cwd:) -> String?` +
