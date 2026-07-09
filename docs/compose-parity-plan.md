@@ -115,6 +115,22 @@ follow-up tasks F1/F2 below on user request, 2026-07-09.)
    accept it; Parser.swift:606-718 in the checkout validates incl. bracketed IPv6).
    Remove the drop-warning; keep the tcp-only-protocol warning. Ports <1024 still fail
    at runtime in the user launchd session — unchanged platform limit.
+11. **Up idempotency / recreate (F3):** `Compose.up` currently name-collides on any
+   pre-existing container (create throws "already exists"), so a failed up bricks the
+   project until manual cleanup. Docker-parity approximation (no labels/config-hash on
+   this codebase; identity = the container name `<project>-<service>` / container_name):
+   before creating each service, look up the target name in a container list snapshot
+   taken at up start —
+   • exists & running → REUSE: emit the standard `.service` progress start+done (the
+     service is up; docker prints "Running"), do not touch it;
+   • exists & not running (created/stopped — incl. the created-but-start-failed case) →
+     force-delete, then create fresh from the current plan (predictable "the file wins"
+     semantics; docker would diff config, we can't);
+   • create/start still fails → error propagates as before (stop at first failure,
+     earlier services stay up), but now the NEXT `up` recovers automatically.
+   The GUI "Retry Remaining" button re-runs Compose.up and therefore inherits recovery
+   for free. Reuse of a same-named container that was never compose-created is
+   accepted (indistinguishable without labels; mirrors docker's container_name rules).
 
 ## Tasks
 
@@ -132,6 +148,15 @@ follow-up tasks F1/F2 below on user request, 2026-07-09.)
   list entry resolution + omission warning, --env-file override. Done when: build +
   full selftest OK + CLI round-trip with a temp .env. Commit:
   `compose: .env files + variable interpolation`.
+- [ ] **F3 — Up idempotency / recreate.** Implement decision 11 in Compose.swift up
+  (container list snapshot at up start; per-service reuse-running /
+  recreate-not-running / create-missing). Extend the live selftest step (or add
+  "compose: up recreate + reuse"): up fixture → second up succeeds reusing both
+  running containers (no error); stop one container via ContainerService → third up
+  recreates exactly that one (new container running, other untouched); pre-create a
+  stopped name-colliding container before a fresh up → recreated cleanly. defer
+  cleanup. Done when: build + full selftest OK. Commit:
+  `compose: idempotent up (reuse running, recreate stopped)`.
 
 - [x] **E1 — Parse layer (Compose.swift + selftest).** ServicePlan gains `profiles:
   [String]`, `healthcheck: Healthcheck?`, `dependsOn: [String: DependsCondition]`
