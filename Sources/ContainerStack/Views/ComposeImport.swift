@@ -19,6 +19,7 @@ struct ComposeImportSheet: View {
     }
     @State private var phase: Phase = .ready
     @State private var completed: Set<Compose.StepKind> = []
+    @State private var runtimeWarnings: [String] = []  // from up's hosts sync
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -43,12 +44,12 @@ struct ComposeImportSheet: View {
                         serviceCard(svc)
                     }
 
-                    if !plan.warnings.isEmpty {
+                    if !plan.warnings.isEmpty || !runtimeWarnings.isEmpty {
                         VStack(alignment: .leading, spacing: 4) {
                             Label("Not everything in the file is supported", systemImage: "exclamationmark.triangle")
                                 .font(.caption.weight(.semibold))
                                 .foregroundStyle(.orange)
-                            ForEach(plan.warnings, id: \.self) { w in
+                            ForEach(plan.warnings + runtimeWarnings, id: \.self) { w in
                                 Text(w).font(.caption).foregroundStyle(.secondary)
                             }
                         }
@@ -159,19 +160,24 @@ struct ComposeImportSheet: View {
         phase = .running("Starting…")
         Task {
             do {
-                try await Compose.up(plan: plan) { step, done in
+                let result = try await Compose.up(plan: plan) { step, done in
                     await MainActor.run {
                         if done {
-                            completed.insert(step)
+                            // .waiting is transient — the checkmark grid only keys
+                            // on volume/network/service steps.
+                            if case .waiting = step {} else { completed.insert(step) }
                         } else {
                             switch step {
                             case .volume(let v): phase = .running("Creating volume \(v)…")
                             case .network(let n): phase = .running("Creating network \(n)…")
                             case .service(let s): phase = .running("Starting \(s)… (pulls the image if needed)")
+                            case .waiting(let s, let c):
+                                phase = .running("Waiting for \(s) (\(c.replacingOccurrences(of: "service_", with: "")))…")
                             }
                         }
                     }
                 }
+                runtimeWarnings = result.warnings
                 phase = .done
                 await state.refreshAll()
             } catch {
@@ -201,12 +207,30 @@ enum ComposeImport {
         do {
             let text = try String(contentsOf: url, encoding: .utf8)
             let dir = url.deletingLastPathComponent()
-            let plan = try Compose.parse(
-                text: text, projectName: dir.lastPathComponent, baseDir: dir.path)
+            // The file's sibling .env participates automatically, like docker.
+            let environment = try Compose.effectiveEnvironment(composeDir: dir.path)
+            let plan = try parseFiltered(
+                text: text, projectName: dir.lastPathComponent, baseDir: dir.path, environment: environment)
             return .success(plan)
         } catch {
             let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
             return .failure(CLIError(command: "compose import", message: message))
         }
+    }
+
+    /// Parse for the GUI import: the sheet has no profile picker (v1), so
+    /// profile-gated services are excluded like docker's default and surfaced
+    /// as info warnings pointing at the CLI.
+    static func parseFiltered(
+        text: String, projectName: String, baseDir: String?, environment: [String: String] = [:]
+    ) throws -> Compose.Plan {
+        let parsed = try Compose.parse(text: text, projectName: projectName, baseDir: baseDir, environment: environment)
+        var plan = try parsed.selecting(services: [], activeProfiles: [])
+        let kept = Set(plan.services.map(\.service))
+        for svc in parsed.services where !kept.contains(svc.service) {
+            let profile = svc.profiles.first ?? "?"
+            plan.warnings.append("service \(svc.service) requires profile \(profile) — import via CLI --profile \(profile)")
+        }
+        return plan
     }
 }

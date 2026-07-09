@@ -55,10 +55,16 @@ remaining A item is #2 (file browsing), intentionally scheduled in Wave 2.
 - ✅ Docker Compose import — Containers → ⋯ → Import Compose File: parse → preview
   (services in depends_on order, volumes/networks, per-service CLI equivalents,
   honest warnings for unsupported keys) → create & start. Supported subset: image,
-  container_name, environment (both forms), ports (host-ip/proto dropped w/ warning),
-  volumes (named/bind/tmpfs, ro), networks, cpus/mem_limit + deploy.resources.limits,
-  command, user, working_dir, depends_on (order only). `build:` not yet.
-  Headless: `Davit compose plan|up <file>`; parser covered by a selftest step.
+  container_name, environment (both forms), env_file, entrypoint, ports (incl.
+  host-IP binds; non-tcp protocols warned), volumes (named/bind/tmpfs, ro),
+  networks, cpus/mem_limit + deploy.resources.limits, command, user, working_dir,
+  depends_on (incl. service_healthy / service_completed_successfully conditions),
+  healthcheck, profiles, stop_grace_period/stop_signal, `.env` + `${VAR}`
+  interpolation; in-container service-name resolution via managed /etc/hosts
+  entries. `build:` not yet.
+  Headless: `Davit compose plan|up|down|ps|logs|stop|start|restart|pull|exec` with
+  docker-style file autodiscovery, service selection and profiles; parser and
+  lifecycle covered by selftest steps.
 - ✅ Image build from a Dockerfile — Images → Build Image: context/Dockerfile
   pickers, tag, build args, no-cache/re-pull toggles; drives the platform's
   BuildKit shim over vsock (auto-starting the builder), exports OCI, loads +

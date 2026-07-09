@@ -195,13 +195,19 @@ enum ContainerService {
 
     // MARK: Container lifecycle
 
-    static func start(_ id: String) async throws {
+    /// `retainExitCode` hands the bootstrap process to `ComposeExitCodes` so the
+    /// init exit code can be awaited later (snapshots don't carry it).
+    static func start(_ id: String, retainExitCode: Bool = false) async throws {
         let client = ContainerClient()
         let container = try await client.get(id: id)
         guard container.status != .running else { return }
         let io = try ProcessIO.create(tty: container.configuration.initProcess.terminal, interactive: false, detach: true)
         do {
             let process = try await client.bootstrap(id: id, stdio: io.stdio, dynamicEnv: [:])
+            // Register BEFORE start: a fast one-shot can exit — and the
+            // apiserver reap its runtime client — before a wait issued
+            // afterwards lands, losing the exit code (see ComposeExitCodes).
+            if retainExitCode { await ComposeExitCodes.shared.register(id: id, process: process) }
             try await process.start()
             try io.closeAfterStart()
         } catch {
@@ -211,8 +217,12 @@ enum ContainerService {
         }
     }
 
-    static func stop(_ id: String) async throws {
-        try await ContainerClient().stop(id: id)
+    /// Defaults mirror the platform's stop options (5s grace, SIGTERM).
+    /// Compose down passes stop_grace_period / stop_signal through here; the
+    /// signal is a name or number ("SIGUSR1", "USR1", "10") parsed daemon-side.
+    static func stop(_ id: String, timeoutSeconds: Int32 = 5, signal: String? = nil) async throws {
+        try await ContainerClient().stop(
+            id: id, opts: ContainerStopOptions(timeoutInSeconds: timeoutSeconds, signal: signal))
     }
 
     static func kill(_ id: String) async throws {
@@ -250,7 +260,8 @@ enum ContainerService {
         processArgs: [String],
         managementArgs: [String],
         resourceArgs: [String],
-        commandArgs: [String]
+        commandArgs: [String],
+        retainExitCode: Bool = false
     ) async throws {
         do {
             // The run path auto-pulls missing images; stage helper credentials first.
@@ -286,7 +297,7 @@ enum ContainerService {
                 kernel: kernel,
                 initImage: initImage
             )
-            try await start(id)
+            try await start(id, retainExitCode: retainExitCode)
         } catch let e as CLIError {
             throw e
         } catch {

@@ -26,7 +26,7 @@ in-terminal shell (`davit exec`), and even launchd service bootstrap all go thro
 - **Machines** — Apple's container machines (lightweight general-purpose VMs with your home directory mounted and a stable `.machine` DNS name): create from any image with CPU/memory sizing, boot/stop, set the default, delete; detail view with configuration overview, streamed logs, live stats and inspect JSON; one-click **Terminal** into the machine's login shell; edit CPUs/memory/home-mount (applies on next boot). `Davit machine list|create|boot|stop|delete|exec|set` headless.
 - **Run Container sheet** — image picker, name, command, ports, env vars, volume/bind mounts, CPU/memory limits, network selection.
 - **Build images** — Images → Build Image: pick a context folder and Dockerfile, set tag/build-args, and Davit drives the platform's BuildKit builder (starting it if needed), then loads and tags the result into the image store. `Davit build -t <tag> <context-dir>` headless.
-- **Compose import** — Containers → ⋯ → Import Compose File: parses a `docker-compose.yml`, previews exactly what will be created (services in `depends_on` order, named volumes, networks, the equivalent `container run` command per service, and warnings for anything unsupported), then creates and starts the stack. `Davit compose plan|up <file>` headless.
+- **Compose import** — Containers → ⋯ → Import Compose File: parses a compose file, previews exactly what will be created (services in `depends_on` order, named volumes, networks, the equivalent `container run` command per service, and warnings for anything unsupported), then creates and starts the stack — honoring `healthcheck`s, `profiles`, `depends_on` conditions (`service_healthy`, `service_completed_successfully`), `env_file:`/`entrypoint:`, and `${VAR}` interpolation from the file's sibling `.env` merged under the process environment. Headless: the full lifecycle — `Davit compose plan | up [-d] | down [-v] | ps | logs [-f\|--follow] [--tail <n>] | stop | start | restart | pull | exec <service> <command…>`, each taking `[-f <file>] [--env-file <path>] [--profile <p>]… [service…]` — autodiscovers the file like docker (`compose.yaml`, `compose.yml`, `docker-compose.yml`, `docker-compose.yaml`, walking up parent directories; `COMPOSE_FILE` wins). Naming services scopes the command: `plan`/`up` add the dependency closure, while `stop`/`start`/`restart`/`pull`/`ps` and `down` apply to exactly the named services (docker behavior). Service discovery: the platform's DNS cannot resolve compose service names, so `up`/`start`/`restart` write managed `/etc/hosts` entries (suffixed `# davit-compose`) into every running container of the project, mapping each service and container name to its current IP — refreshed on every run, so a recreated service's new IP reaches the containers that kept running. Caveat: containers recreated outside compose keep stale entries until the next `up` or `start`; images without `/bin/sh` can't be patched (warning).
 - **Registries** — sign in to Docker Hub / ghcr.io / any registry to pull private images (Settings → Registries); credentials are verified against the registry and stored in the login keychain, shared with the `container` CLI. **Docker credential helpers** are honored too: if `~/.docker/config.json` has a `credHelpers`/`credsStore` entry for a registry (Google Artifact Registry via `gcloud`, ECR, etc.), Davit invokes the helper right before each pull and stages the short-lived token for the platform, so hourly-expiring credentials always work.
 - **Menu bar extra** — service status, per-container quick actions from anywhere.
 - **Auto-start containers** — mark any container "Start when Davit Opens" (context menu); on launch Davit brings the platform services up if needed and starts them. Combined with *Open at login*, your containers are running when you sit down.
@@ -138,12 +138,18 @@ under `/usr/local` and updates independently.
 The app binary doubles as a small tool:
 
 ```sh
-Davit exec <container-id>        # interactive TTY shell into a container (used by "Open Terminal")
+Davit exec <container-id> [command…]   # interactive TTY shell — or a one-off command — in a container (used by "Open Terminal")
 Davit selftest                   # end-to-end test of the XPC service layer against the live daemon
 Davit system start|stop          # bootstrap / tear down the container launchd services
 Davit platform install|remove    # download + verify Apple's signed pkg into an app-managed install root
 Davit registry login|list|logout # registry credentials (login reads the password from stdin)
-Davit compose plan|up <file>     # parse a compose file (plan: print only) / create & start the stack
+Davit compose <subcommand> [-f <file>] [--env-file <path>] [--profile <p>]… [service…]
+    # subcommands: plan | up [-d|--detach] | down [-v|--volumes] | ps | logs [-f|--follow] [--tail <n>]
+    #              stop | start | restart | pull | exec <service> <command…>
+    # file autodiscovered like docker; .env + ${VAR} interpolation; naming services scopes the
+    # command (plan/up add the dependency closure; stop/start/restart/pull/ps/down take exactly
+    # the named services). In-container service names resolve via managed /etc/hosts entries,
+    # re-synced on every up/start/restart — recreates outside compose need another up/start.
 Davit build -t <tag> <dir>       # build an image from <dir>/Dockerfile via the BuildKit shim
 Davit machine list|create|boot|stop|delete   # container machines (micro VMs)
 Davit --snapshot /tmp/shots      # render every screen to PNGs via ImageRenderer (no screen-recording permission)
