@@ -985,6 +985,95 @@ extension Compose {
         }
     }
 
+    /// Streams existing project containers' stdout logs, each line prefixed
+    /// `<container>  | ` with the prefix column aligned across containers.
+    /// Naming `services` scopes the output to exactly those (no dependency
+    /// closure — docker parity); never-created containers are skipped. `tail`
+    /// limits the backlog per container (nil = everything). With `follow` the
+    /// backlog is followed by a readability handler per container printing new
+    /// lines as they arrive, and the call never returns — Ctrl-C ends the
+    /// process (the containers keep running). `output` receives whole prefixed
+    /// lines (stdout by default) so the selftest can capture the non-follow path.
+    static func logs(
+        plan: Plan,
+        services requested: [String] = [],
+        tail: Int? = nil,
+        follow: Bool = false,
+        output: @escaping @Sendable (String) -> Void = { FileHandle.standardOutput.write(Data($0.utf8)) }
+    ) async throws {
+        let known = Set(plan.services.map(\.service))
+        for name in requested where !known.contains(name) { throw Error.noSuchService(name) }
+        let selected = requested.isEmpty ? known : Set(requested)
+
+        // Log lines bypass print's stdio buffer — flush it so any headers the
+        // CLI printed earlier stay ahead of them when stdout is a pipe.
+        fflush(stdout)
+
+        let existing = Set(try await ContainerService.listContainers().map(\.id))
+        let targets = plan.services.filter { selected.contains($0.service) && existing.contains($0.name) }
+        let width = targets.map(\.name.count).max() ?? 0
+        var streams: [(prefix: String, name: String, handle: FileHandle)] = []
+        for svc in targets {
+            // Index 0 is the stdio log, 1 the boot log (LogStreamer convention);
+            // a container deleted since the snapshot just drops out.
+            guard let handles = try? await ContainerClient().logs(id: svc.name), !handles.isEmpty else { continue }
+            let prefix = svc.name.padding(toLength: width, withPad: " ", startingAt: 0) + "  | "
+            streams.append((prefix, svc.name, handles[0]))
+        }
+
+        for stream in streams {
+            // Remember the end of file before the backwards tail read, so the
+            // follow handler below resumes exactly where the backlog ended.
+            let end = (try? stream.handle.seekToEnd()) ?? 0
+            for line in LogStreamer.readTail(fh: stream.handle, maxLines: tail.map { max(0, $0) } ?? Int.max) {
+                output(stream.prefix + line + "\n")
+            }
+            try? stream.handle.seek(toOffset: end)
+        }
+
+        guard follow, !streams.isEmpty else {
+            for stream in streams { try? stream.handle.close() }
+            return
+        }
+        let printer = LinePrinter(output: output)
+        for stream in streams {
+            stream.handle.readabilityHandler = { handle in
+                let data = handle.availableData
+                guard !data.isEmpty else { return }
+                printer.emit(prefix: stream.prefix, key: stream.name, data: data)
+            }
+        }
+        // Nothing left to do in-process: block until Ctrl-C ends the process —
+        // in the CLI the semaphore wait never returns, which is the point.
+        while true { try await Task.sleep(for: .seconds(86_400)) }
+    }
+
+    /// Serializes prefixed log writes from the per-container readability
+    /// handlers (they fire on independent dispatch queues) and holds each
+    /// stream's trailing partial line until its newline arrives.
+    private final class LinePrinter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var partial: [String: Data] = [:]
+        private let output: @Sendable (String) -> Void
+
+        init(output: @escaping @Sendable (String) -> Void) { self.output = output }
+
+        func emit(prefix: String, key: String, data: Data) {
+            lock.lock(); defer { lock.unlock() }
+            var buffer = partial[key, default: Data()]
+            buffer.append(data)
+            while let nl = buffer.firstIndex(of: 0x0A) {
+                var line = buffer.subdata(in: buffer.startIndex..<nl)
+                if line.last == 0x0D { line.removeLast() }
+                if !line.isEmpty, let text = String(data: line, encoding: .utf8) {
+                    output(prefix + text + "\n")
+                }
+                buffer.removeSubrange(buffer.startIndex...nl)
+            }
+            partial[key] = buffer
+        }
+    }
+
     /// Probes `container` with its healthcheck until healthy — the first exit-0
     /// probe, even inside start_period — or unhealthy after `retries` consecutive
     /// countable failures (failures before start_period has elapsed don't count).

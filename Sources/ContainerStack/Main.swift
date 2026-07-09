@@ -336,7 +336,7 @@ enum ComposeCLI {
 
     /// Implemented subcommands; the remaining decision-12 ones land in later
     /// rounds by adding their name here and a case in run().
-    private static let subcommands: Set<String> = ["plan", "up", "down", "ps"]
+    private static let subcommands: Set<String> = ["plan", "up", "down", "ps", "logs"]
 
     /// Per-subcommand flags, token → canonical name. These shadow the shared
     /// flags: for `logs`, -f means --follow, so its file flag is `--file` only.
@@ -435,12 +435,16 @@ enum ComposeCLI {
                     if let w = discoveryWarning { print("warning: \(w)") }
                     for w in plan.warnings { print("warning: \(w)") }
                     if inv.subcommand == "up" {
-                        // -d/--detach parses; up already returns after starting
-                        // (attached logs arrive with the logs subcommand).
                         try await Compose.up(plan: plan) { step, done in
                             if done { print("up: \(step.label) done") }
                         }
                         print("compose up: ok")
+                        if !inv.flags.contains("detach") {
+                            // docker-compose behavior: a non-detached up stays
+                            // attached to the selected services' logs.
+                            print("Attaching to logs (Ctrl-C detaches; containers keep running)")
+                            try await Compose.logs(plan: plan, follow: true)
+                        }
                     }
                 case "down":
                     // The whole file, every profile active: teardown must not
@@ -453,6 +457,12 @@ enum ComposeCLI {
                     }
                     for w in warnings { print("warning: \(w)") }
                     print("compose down: ok")
+                case "logs":
+                    // Like down: the whole file, no profile filter — existing
+                    // containers must stay visible even when profile-gated.
+                    try await Compose.logs(
+                        plan: parsed, services: inv.services,
+                        tail: inv.counts["tail"], follow: inv.flags.contains("follow"))
                 case "ps":
                     let plan = try parsed.selecting(services: inv.services, activeProfiles: inv.profiles)
                     let records = try await Compose.ps(plan: plan)
@@ -1252,6 +1262,62 @@ enum SelfTest {
             }
             await cleanup()
         }
+        await step("compose: logs (non-follow)") {
+            let names = ["davit-selftest-logs-a", "davit-selftest-logs-longer"]
+            func cleanup() async {
+                for n in names { try? await ContainerService.delete(n, force: true) }
+            }
+            await cleanup()  // leftovers from a previous aborted run
+
+            let plan = try Compose.parse(text: """
+            name: davit-selftest-logs
+            services:
+              a:
+                image: alpine:latest
+                command: ["/bin/sh", "-c", "echo davit-logs-alpha1; echo davit-logs-alpha2; sleep 300"]
+              longer:
+                image: alpine:latest
+                command: ["/bin/sh", "-c", "echo davit-logs-beta; sleep 300"]
+            """, projectName: "ignored")
+            func capture(services: [String] = [], tail: Int? = nil) async throws -> String {
+                let sink = OutputLog()
+                try await Compose.logs(plan: plan, services: services, tail: tail) { sink.append($0) }
+                return sink.text
+            }
+            do {
+                try await Compose.up(plan: plan) { _, _ in }
+                // The echoes reach the daemon's log files asynchronously — poll
+                // the real read path until both services' lines are visible.
+                var all = ""
+                for _ in 0..<60 {
+                    all = try await capture()
+                    if all.contains("davit-logs-alpha2"), all.contains("davit-logs-beta") { break }
+                    try await Task.sleep(for: .milliseconds(500))
+                }
+                // The prefix column is aligned across containers: the shorter
+                // name is padded to the longer one's width.
+                let pad = String(repeating: " ", count: "davit-selftest-logs-longer".count - "davit-selftest-logs-a".count)
+                guard all.contains("davit-selftest-logs-a\(pad)  | davit-logs-alpha1"),
+                      all.contains("davit-selftest-logs-a\(pad)  | davit-logs-alpha2"),
+                      all.contains("davit-selftest-logs-longer  | davit-logs-beta")
+                else { throw CLIError(command: "selftest", message: "prefixed log lines missing: \(all.debugDescription)") }
+
+                // --tail limits the backlog per container; naming a service
+                // scopes the output to it (and re-aligns the prefix column).
+                let tailed = try await capture(services: ["a"], tail: 1)
+                guard tailed.contains("davit-selftest-logs-a  | davit-logs-alpha2"),
+                      !tailed.contains("davit-logs-alpha1"), !tailed.contains("davit-logs-beta")
+                else { throw CLIError(command: "selftest", message: "tail/scope wrong: \(tailed.debugDescription)") }
+                do {
+                    _ = try await capture(services: ["nope"])
+                    throw CLIError(command: "selftest", message: "logs with unknown service not rejected")
+                } catch Compose.Error.noSuchService("nope") { /* expected */ }
+            } catch {
+                await cleanup()
+                throw error
+            }
+            await cleanup()
+        }
         await step("registry: list + reject bad credentials") {
             _ = RegistryService.listLogins()  // must not throw
             do {
@@ -1280,6 +1346,14 @@ final class ProgressLog: @unchecked Sendable {
     private var items: [(Compose.StepKind, Bool)] = []
     func append(_ step: Compose.StepKind, _ done: Bool) { lock.lock(); items.append((step, done)); lock.unlock() }
     var all: [(Compose.StepKind, Bool)] { lock.lock(); defer { lock.unlock() }; return items }
+}
+
+/// Lock-protected sink for captured compose log output in the selftest.
+final class OutputLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var buffer = ""
+    func append(_ s: String) { lock.lock(); buffer += s; lock.unlock() }
+    var text: String { lock.lock(); defer { lock.unlock() }; return buffer }
 }
 
 /// Tiny lock-protected box for progress dedup in headless installs.

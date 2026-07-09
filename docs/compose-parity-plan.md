@@ -244,7 +244,7 @@ follow-up tasks F1/F2 below on user request, 2026-07-09.)
   second down idempotent → up again → down -v removes volume; service-scoped down
   removes only that container and no networks/volumes. Done when: build + full
   selftest OK + CLI round-trip. Commit: `compose: down + ps subcommands`.
-- [ ] **G2 — logs + up attach.** Decision 15. Live selftest: fixture printing known
+- [x] **G2 — logs + up attach.** Decision 15. Live selftest: fixture printing known
   lines → `logs --tail` output contains prefixed lines (non-follow path); follow mode
   verified by the verifier manually with a timeout. up -d returns immediately (existing
   behavior); non-detached attach is verifier-tested manually. Done when: build + full
