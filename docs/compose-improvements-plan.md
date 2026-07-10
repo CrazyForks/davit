@@ -111,6 +111,55 @@ level to .debug for the process unless DAVIT_LOG_LEVEL was explicitly set.
   diff (adversarially verified findings), fixer, docs/usage final pass, full suite +
   smoke round-trip, commit `compose: improvements round review fixes + docs`.
 
+## I6 — `Davit run` (docker-style single-container run, user request 2026-07-10)
+
+**Design.** New headless mode `Davit run [flags] IMAGE [COMMAND...]` (flags strictly
+before IMAGE, docker-style) in Main.swift, delegating to the existing
+`ContainerService.runContainer` facade — the CLI layer only routes flags into the
+four arg arrays that Apple's `Flags.Process/Management/Resource` parsers already
+accept (this IS the docker-like vocabulary):
+- process: `-e/--env`, `--env-file`, `-t/--tty`, `-u/--user`, `--uid`, `--gid`,
+  `-w/--workdir`, `--ulimit`
+- resource: `-c/--cpus`, `-m/--memory`
+- management: `--name`, `-p/--publish`, `-v/--volume`, `--mount`, `--tmpfs`,
+  `--network`, `--entrypoint`, `-l/--label`, `--platform`, `--arch`, `--os`,
+  `--cap-add`, `--cap-drop`, `--init`, `--read-only`, `--shm-size`, `--dns`,
+  `--dns-search`, `--dns-option`, `--no-dns`, `--rosetta`, `--virtualization`,
+  `--ssh`, `--cidfile`
+Routing = a small table {flag → bucket, takesValue}; unknown flag → usage exit 2
+naming it. Everything after IMAGE is the command argv (never parsed).
+
+Davit-side semantics (not passthrough):
+- `-d/--detach`: detached prints the container name (docker prints the ID; name==id
+  here). WITHOUT `-d`, attach: after start, stream the container's logs (reuse the
+  compose log-follow machinery, no prefix for a single container) with the banner
+  note that Ctrl-C detaches without stopping the container — documented divergence
+  from docker (signals can't be forwarded; upstream kill-encoding bug).
+- `--rm`: thread a new defaulted `autoRemove: Bool = false` through
+  `ContainerService.runContainer` into `ContainerCreateOptions(autoRemove:)`
+  (today hardcoded false — existing callers unchanged).
+- `--pull missing|always|never`: Davit-side policy like compose's.
+- `-i/--interactive`: hard error exit 2 — "interactive runs aren't supported; start
+  detached, then `Davit exec <name>`".
+- Docker flags with no platform mapping (`--restart`, `--add-host`, `--privileged`,
+  `--hostname`, `--gpus`, …): hard error naming the platform limitation (parity
+  scripts must fail loudly, not silently degrade).
+- `--verbose`/`-q/--quiet` honored like compose (reuse the I4 output level).
+
+**Tasks:**
+- [ ] **I6 — `Davit run` mode.** Per Design I6: Main.swift run mode + routing table,
+  Backend `autoRemove` param, usage string + README (Binary modes + a feature-bullet
+  mention). Selftest: pure routing tests (each bucket, unknown flag, -i error,
+  post-IMAGE argv untouched); live: run alpine sleep with --name/--env/--publish/
+  --label → assert running + config via inspect → clean; `--rm` one-shot `true` →
+  container absent after exit (poll ≤30s). Done when: build + full selftest OK +
+  CLI round-trip (detached run + attached run streaming a known log line, Ctrl-C-free
+  via timeout kill, container still running after). Commit:
+  `run: docker-style single-container run mode`.
+- [ ] **I7 — run review + wrap.** Reviewer (correctness + docker-parity) over the I6
+  diff, adversarial verify, fixes, full suite + round-trip, commit
+  `run: review fixes`.
+
 ## Notes / risks
 
 - Platform 1.1.0 bump landed on main — if the local daemon/selftest misbehaves for
