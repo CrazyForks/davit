@@ -156,7 +156,7 @@ Davit-side semantics (not passthrough):
   CLI round-trip (detached run + attached run streaming a known log line, Ctrl-C-free
   via timeout kill, container still running after). Commit:
   `run: docker-style single-container run mode`.
-- [ ] **I7 — run review + wrap.** Reviewer (correctness + docker-parity) over the I6
+- [x] **I7 — run review + wrap.** Reviewer (correctness + docker-parity) over the I6
   diff, adversarial verify, fixes, full suite + round-trip, commit
   `run: review fixes`.
 

@@ -1,6 +1,7 @@
 import AppKit
 import ArgumentParser
 import ContainerAPIClient
+import ContainerizationError
 import ContainerizationOCI
 import ContainerPersistence
 import ContainerPlugin
@@ -193,16 +194,27 @@ enum ContainerService {
         reference.contains("/containerization/vminit") || reference.contains("/container-builder-shim/")
     }
 
-    /// Whether `reference` already resolves to a locally present image — the
-    /// same lookup `ClientImage.fetch` does internally before falling back to
-    /// a pull. Used by `davit run --pull never` to fail fast instead of
-    /// silently degrading to `missing`'s pull-if-absent behavior.
-    static func imageExists(_ reference: String) async throws -> Bool {
+    /// Whether `reference` already resolves to a locally present image AT the
+    /// requested platform variant — the same two-step check `ClientImage.fetch`
+    /// does internally (reference lookup, then `match.config(for:)` to confirm
+    /// the specific platform's config is present) before falling back to a
+    /// pull. Used by `davit run --pull never` to fail fast instead of silently
+    /// degrading to `missing`'s pull-if-absent behavior. `managementArgs` are
+    /// the raw `--platform`/`--os`/`--arch` flags (docker-style, may be empty)
+    /// so this matches exactly what the create path would request; only a
+    /// `.notFound` from either step means "not present" — any other error
+    /// (unreachable registry config, corrupt store, ...) is rethrown rather
+    /// than masked as a plain "false".
+    static func imageExists(_ reference: String, managementArgs: [String] = []) async throws -> Bool {
         let config = try await Backend.systemConfig()
         do {
-            _ = try await ClientImage.get(reference: reference, containerSystemConfig: config)
+            let image = try await ClientImage.get(reference: reference, containerSystemConfig: config)
+            let management = try Flags.Management.parse(managementArgs)
+            let platform = try DefaultPlatform.resolveWithDefaults(
+                platform: management.platform, os: management.os, arch: management.arch, log: Backend.log)
+            _ = try await image.config(for: platform)
             return true
-        } catch {
+        } catch let error as ContainerizationError where error.isCode(.notFound) {
             return false
         }
     }
@@ -270,7 +282,15 @@ enum ContainerService {
         guard container.status != .running else { return }
         let io = try ProcessIO.create(tty: container.configuration.initProcess.terminal, interactive: false, detach: true)
         do {
-            let process = try await client.bootstrap(id: id, stdio: io.stdio, dynamicEnv: [:])
+            // Mirrors apple's own ContainerRun/ContainerStart: the daemon-side
+            // ssh-forwarding lookup (RuntimeService.sshAuthSocketHostUrl) only
+            // fires when the container's own config has `ssh` set, so handing
+            // this along unconditionally is a no-op for every non-ssh container.
+            var dynamicEnv: [String: String] = [:]
+            if let sshAuthSock = ProcessInfo.processInfo.environment["SSH_AUTH_SOCK"] {
+                dynamicEnv["SSH_AUTH_SOCK"] = sshAuthSock
+            }
+            let process = try await client.bootstrap(id: id, stdio: io.stdio, dynamicEnv: dynamicEnv)
             // Register BEFORE start: a fast one-shot can exit — and the
             // apiserver reap its runtime client — before a wait issued
             // afterwards lands, losing the exit code (see ComposeExitCodes).

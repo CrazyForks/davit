@@ -333,6 +333,11 @@ struct CLIOutput {
     func verbose(_ s: String) { if level == .verbose { print(s) } }
     /// Like `say` but without an added newline — pull's streamed lines carry their own.
     func sayRaw(_ s: String) { if level != .quiet { print(s, terminator: "") } }
+    /// Like `say`/`warn` but to stderr — for status/banner lines a caller
+    /// whose stdout is reserved for something else (`davit run`'s attached
+    /// container log stream) must never mix into that stream.
+    func sayErr(_ s: String) { if level != .quiet { FileHandle.standardError.write(Data((s + "\n").utf8)) } }
+    func warnErr(_ s: String) { if level != .quiet { FileHandle.standardError.write(Data("warning: \(s)\n".utf8)) } }
 }
 
 /// `davit compose <sub>` — shared CLI plumbing for every compose subcommand
@@ -706,7 +711,12 @@ enum RunCLI {
         "--rosetta": (.management, false),
         "--virtualization": (.management, false),
         "--ssh": (.management, false),
-        "--cidfile": (.management, true),
+        // --cidfile is NOT routed here: unlike apple's own ContainerRun/
+        // ContainerCreate, Davit's create path (`Backend.runContainer` →
+        // `Utility.containerConfigFromFlags`) never reads
+        // `Flags.Management.cidfile` — writing the file is done by the CLI
+        // command layer itself. It's intercepted below (like --name) so
+        // `execute()` can write it after the container is actually created.
     ]
 
     /// Real `docker run` flags this platform has no equivalent for. Naming
@@ -735,6 +745,7 @@ enum RunCLI {
       --rm                          remove the container once it stops
       --pull missing|always|never   image pull policy (default: missing)
       --verbose | -q, --quiet       per-run diagnostics (mutually exclusive)
+      --help                        show this usage and exit
       flags must precede IMAGE (docker-style); `--` also ends flag parsing
       docker-style flags: -e/--env, --env-file, -t/--tty, -u/--user, --uid, --gid,
         -w/--workdir, --ulimit, -c/--cpus, -m/--memory, --name, -p/--publish,
@@ -753,6 +764,7 @@ enum RunCLI {
         var management: [String] = []
         var resource: [String] = []
         var name: String? = nil
+        var cidfile: String? = nil
         var detach = false
         var autoRemove = false
         var pullPolicy = "missing"
@@ -762,12 +774,17 @@ enum RunCLI {
 
     /// Thrown by the pure `parseArgs` below instead of exiting the process —
     /// keeps the routing logic selftest-able. `message == nil` prints the
-    /// bare usage line only (e.g. no IMAGE given at all).
-    struct ParseError: Error, Equatable { let message: String? }
+    /// bare usage line only (e.g. no IMAGE given at all). `isHelp` marks
+    /// `--help`: a success path (usage to stdout, exit 0), not a usage error.
+    struct ParseError: Error, Equatable {
+        let message: String?
+        var isHelp: Bool = false
+    }
 
     /// Pure routing core: no I/O, no `exit()` — selftest calls this directly.
     /// `parse(_:)` below is the process-exiting shell `run()` actually uses.
     static func parseArgs(_ args: [String]) throws -> Invocation {
+        var args = args
         var inv = Invocation()
         var i = 0
         while i < args.count {
@@ -806,14 +823,23 @@ enum RunCLI {
                 let v = try value()
                 inv.name = v
                 inv.management.append(contentsOf: [arg, v])
+            } else if arg == "--cidfile" {
+                // Intercepted rather than routed (unlike apple's own CLI,
+                // Davit's create path never reads Flags.Management.cidfile) —
+                // execute() writes it itself once the container exists.
+                inv.cidfile = try value()
             } else if arg == "--verbose" {
                 guard inline == nil else { throw ParseError(message: "flag \(arg) takes no value") }
                 inv.verbose = true
             } else if arg == "-q" || arg == "--quiet" {
                 guard inline == nil else { throw ParseError(message: "flag \(arg) takes no value") }
                 inv.quiet = true
+            } else if arg == "--help" {
+                guard inline == nil else { throw ParseError(message: "flag \(arg) takes no value") }
+                throw ParseError(message: nil, isHelp: true)
             } else if unsupported.contains(arg) {
-                throw ParseError(message: "docker flag \(arg) has no equivalent on this platform (apple/container doesn't support it) — remove it or adjust the parity script")
+                let hint = arg == "-h" ? "; for help, use --help" : ""
+                throw ParseError(message: "docker flag \(arg) has no equivalent on this platform (apple/container doesn't support it) — remove it or adjust the parity script\(hint)")
             } else if let route = routing[arg] {
                 if route.takesValue {
                     let v = try value()
@@ -830,6 +856,19 @@ enum RunCLI {
                     case .resource: inv.resource.append(arg)
                     }
                 }
+            } else if raw.hasPrefix("-"), !raw.hasPrefix("--"), raw.count > 2,
+                      raw.dropFirst().allSatisfy({ "dtiq".contains($0) }) {
+                // Docker's clustered short flags (`-it`, `-ti`, `-dit`, ...) —
+                // expand into individual tokens and splice them back into the
+                // stream so each one re-dispatches through the branches
+                // above. Docker users overwhelmingly type `-it`, not `-i -t`
+                // separately; this is in particular what surfaces the
+                // tailored `-i` rejection instead of a bare "unknown flag:
+                // -it". Any letter outside {d,t,i,q} (Davit's only no-value
+                // short flags) falls through to the plain unknown-flag error
+                // below, naming the whole cluster.
+                args.replaceSubrange(i...i, with: raw.dropFirst().map { "-\($0)" })
+                continue
             } else if raw.hasPrefix("-"), raw != "-" {
                 throw ParseError(message: "unknown flag: \(raw)")
             } else {
@@ -852,11 +891,17 @@ enum RunCLI {
     }
 
     /// `parseArgs` wrapped for real CLI use: usage problems print to stderr
-    /// and exit 2, naming the offending token where there is one.
+    /// and exit 2, naming the offending token where there is one. `--help` is
+    /// the one success path: usage to stdout, exit 0 (general CLI convention
+    /// docker itself follows — a well-known flag must never look like a
+    /// syntax error).
     static func parse(_ args: [String]) -> Invocation {
         do {
             return try parseArgs(args)
         } catch let error as ParseError {
+            if error.isHelp {
+                print(usage); exit(0)
+            }
             let prefix = error.message.map { $0 + "\n" } ?? ""
             FileHandle.standardError.write(Data((prefix + usage + "\n").utf8)); exit(2)
         } catch {
@@ -869,15 +914,28 @@ enum RunCLI {
     /// directly (no `exit()` in here, unlike `run()` itself). Returns the
     /// resolved name (mirrors `Backend.runContainer`'s own id computation:
     /// an empty --name value is treated like "not given", random id — same
-    /// as the GUI Run sheet).
-    static func execute(_ inv: Invocation, output: CLIOutput = CLIOutput(level: .normal)) async throws -> String {
+    /// as the GUI Run sheet). `retainExitCode` (foreground runs only, set by
+    /// `run()`) registers the init process with `ComposeExitCodes` so the
+    /// caller can propagate the container's own exit code once it stops.
+    static func execute(
+        _ inv: Invocation, output: CLIOutput = CLIOutput(level: .normal), retainExitCode: Bool = false
+    ) async throws -> String {
         let resolvedName = Utility.createContainerID(name: (inv.name?.isEmpty == true) ? nil : inv.name)
+
+        // docker parity: refuse up front rather than silently clobbering
+        // another run's cidfile (or one left behind by a container that's
+        // still around) — mirrors docker's client-side cidfile.go check.
+        let cidfile = (inv.cidfile?.isEmpty == false) ? inv.cidfile : nil
+        if let cidfile, FileManager.default.fileExists(atPath: cidfile) {
+            throw CLIError(command: "run", message: "container ID file found, make sure the other container isn't running or delete \(cidfile)")
+        }
+
         switch inv.pullPolicy {
         case "always":
             output.verbose("pulling \(inv.image) (--pull always)")
             try await ContainerService.pullImage(inv.image) { _ in }
         case "never":
-            guard try await ContainerService.imageExists(inv.image) else {
+            guard try await ContainerService.imageExists(inv.image, managementArgs: inv.management) else {
                 throw CLIError(command: "run", message: "image not present locally and --pull never was given: \(inv.image)")
             }
         default:
@@ -892,8 +950,25 @@ enum RunCLI {
             managementArgs: inv.management,
             resourceArgs: inv.resource,
             commandArgs: inv.command,
-            autoRemove: inv.autoRemove
+            autoRemove: inv.autoRemove,
+            retainExitCode: retainExitCode
         )
+
+        // Apple's own ContainerRun writes this right after bootstrap starts,
+        // with the same 0644/create-only semantics; erroring here (rather
+        // than silently swallowing a write failure) matches "cidfile accepted
+        // means cidfile honored" — and, like apple's own catch block around
+        // this same step, a write failure tears the just-created container
+        // back down rather than leaving an orphaned running container behind
+        // a "run failed" message.
+        if let cidfile {
+            let ok = FileManager.default.createFile(
+                atPath: cidfile, contents: Data(resolvedName.utf8), attributes: [.posixPermissions: 0o644])
+            guard ok else {
+                try? await ContainerService.delete(resolvedName, force: true)
+                throw CLIError(command: "run", message: "failed to write cidfile at \(cidfile)")
+            }
+        }
         return resolvedName
     }
 
@@ -906,7 +981,22 @@ enum RunCLI {
         let semaphore = DispatchSemaphore(value: 0)
         Task.detached {
             do {
-                let resolvedName = try await execute(inv, output: output)
+                // Foreground --rm: don't hand removal to the daemon, which
+                // reaps an auto-remove container the instant its init process
+                // exits — a fast one-shot can race that reap against the log
+                // attach below and lose all output (docker run --rm always
+                // shows it). Create non-removing instead and delete it
+                // ourselves once the attach is done; still gone afterwards,
+                // same as docker, just sequenced so the logs are never lost.
+                let deferRemoval = inv.autoRemove && !inv.detach
+                var createInv = inv
+                if deferRemoval { createInv.autoRemove = false }
+
+                // retainExitCode only matters for the attach path below (a
+                // detached run never waits on it) — always requesting it
+                // there lets a foreground run propagate the container's own
+                // exit code (docker parity) instead of always exiting 0.
+                let resolvedName = try await execute(createInv, output: output, retainExitCode: !inv.detach)
 
                 if inv.detach {
                     // The primary, script-parsed output of `-d` (docker parity)
@@ -922,18 +1012,32 @@ enum RunCLI {
                 // duplicated. Ctrl-C only detaches: signals can't be
                 // forwarded to the guest process on this platform (no exec
                 // signal delivery), so the container keeps running — a
-                // documented divergence from docker, not a bug.
-                output.say("Attaching to logs (Ctrl-C detaches; container keeps running)")
-                guard let handle = await Compose.openLogHandle(resolvedName) else {
-                    output.warn("no log stream available for \(resolvedName)")
-                    exit(0)
+                // documented divergence from docker, not a bug. Banner and
+                // the no-stream warning go to stderr — stdout here is
+                // reserved for the container's own log content, so
+                // `davit run img cmd | consumer` never sees status noise
+                // ahead of (or interleaved with) real output.
+                output.sayErr("Attaching to logs (Ctrl-C detaches; container keeps running)")
+                if let handle = await Compose.openLogHandle(resolvedName) {
+                    // Best-effort: a follow error must not skip the exit-code
+                    // fetch / --rm cleanup below.
+                    try? await Compose.followLogStreams(
+                        [Compose.LogStream(prefix: "", name: resolvedName, handle: handle, backlog: true)],
+                        tail: nil, follow: true,
+                        output: { FileHandle.standardOutput.write(Data($0.utf8)) }
+                    )
+                } else {
+                    output.warnErr("no log stream available for \(resolvedName)")
                 }
-                try await Compose.followLogStreams(
-                    [Compose.LogStream(prefix: "", name: resolvedName, handle: handle, backlog: true)],
-                    tail: nil, follow: true,
-                    output: { FileHandle.standardOutput.write(Data($0.utf8)) }
-                )
-                exit(0)
+
+                // followLogStreams only returns once the container has
+                // stopped, so the registered wait (retainExitCode above)
+                // resolves immediately here.
+                let exitCode = await ComposeExitCodes.shared.exitCode(for: resolvedName) ?? 0
+                if deferRemoval {
+                    try? await ContainerService.delete(resolvedName, force: true)
+                }
+                exit(exitCode)
             } catch {
                 let message = (error as? CLIError)?.message
                     ?? (error as? LocalizedError)?.errorDescription
@@ -1231,6 +1335,65 @@ enum SelfTest {
                     throw CLIError(command: "selftest", message: "--pull message wrong: \(e.message ?? "nil")")
                 }
             }
+
+            // --cidfile is intercepted, not routed into the management bucket
+            // (review fix: apple's create path never reads
+            // Flags.Management.cidfile, so leaving it there silently
+            // dropped it — execute() now writes it itself).
+            let cid = try RunCLI.parseArgs(["--cidfile", "/tmp/davit-selftest.cid", "--name", "x", "alpine"])
+            guard cid.cidfile == "/tmp/davit-selftest.cid", cid.management == ["--name", "x"] else {
+                throw CLIError(command: "selftest", message: "--cidfile routing wrong: cidfile=\(cid.cidfile ?? "nil") management=\(cid.management)")
+            }
+
+            // Docker's clustered short flags (review fix): `-it`/`-ti`/`-dit`
+            // must surface the tailored -i rejection, not a bare "unknown
+            // flag". A cluster with no `i` (`-dt`) expands and routes as if
+            // written separately.
+            for cluster in ["-it", "-ti", "-dit", "-tid"] {
+                do {
+                    _ = try RunCLI.parseArgs([cluster, "alpine"])
+                    throw CLIError(command: "selftest", message: "\(cluster) not rejected as interactive")
+                } catch let e as RunCLI.ParseError {
+                    guard e.message?.contains("interactive runs aren't supported") == true else {
+                        throw CLIError(command: "selftest", message: "\(cluster) message wrong: \(e.message ?? "nil")")
+                    }
+                }
+            }
+            let dtCluster = try RunCLI.parseArgs(["-dt", "alpine"])
+            guard dtCluster.detach, dtCluster.process == ["-t"] else {
+                throw CLIError(command: "selftest", message: "-dt cluster expansion wrong: detach=\(dtCluster.detach) process=\(dtCluster.process)")
+            }
+            // A cluster with an unrecognized letter still falls through to
+            // the plain unknown-flag error, naming the whole token.
+            do {
+                _ = try RunCLI.parseArgs(["-itx", "alpine"])
+                throw CLIError(command: "selftest", message: "-itx not rejected")
+            } catch let e as RunCLI.ParseError {
+                guard e.message == "unknown flag: -itx" else {
+                    throw CLIError(command: "selftest", message: "-itx message wrong: \(e.message ?? "nil")")
+                }
+            }
+
+            // --help is a success path: usage only, no error message.
+            do {
+                _ = try RunCLI.parseArgs(["--help"])
+                throw CLIError(command: "selftest", message: "--help did not throw")
+            } catch let e as RunCLI.ParseError {
+                guard e.isHelp, e.message == nil else {
+                    throw CLIError(command: "selftest", message: "--help parse result wrong: isHelp=\(e.isHelp) message=\(e.message ?? "nil")")
+                }
+            }
+
+            // -h (docker's "hostname", no equivalent here) hints at --help
+            // rather than just declaring itself unsupported.
+            do {
+                _ = try RunCLI.parseArgs(["-h", "myhost", "alpine"])
+                throw CLIError(command: "selftest", message: "-h not rejected")
+            } catch let e as RunCLI.ParseError {
+                guard e.message?.contains("--help") == true else {
+                    throw CLIError(command: "selftest", message: "-h message missing --help hint: \(e.message ?? "nil")")
+                }
+            }
         }
         await step("run: live run with --name/--env/--publish/--label, then --rm one-shot") {
             let name = "davit-selftest-run"
@@ -1275,6 +1438,89 @@ enum SelfTest {
             guard gone else {
                 try? await ContainerService.delete(rmName, force: true)
                 throw CLIError(command: "selftest", message: "run: --rm container still present 30s after a one-shot exit")
+            }
+        }
+        await step("run: --cidfile write + refuse-if-exists (review fix)") {
+            let name = "davit-selftest-cidfile"
+            try? await ContainerService.delete(name, force: true)
+            defer { Task { try? await ContainerService.delete(name, force: true) } }
+
+            let cidPath = FileManager.default.temporaryDirectory
+                .appendingPathComponent("davit-selftest-\(UUID().uuidString).cid").path
+            defer { try? FileManager.default.removeItem(atPath: cidPath) }
+
+            let inv = try RunCLI.parseArgs(["--name", name, "--cidfile", cidPath, "alpine:latest", "sleep", "60"])
+            let resolved = try await RunCLI.execute(inv)
+            guard resolved == name else {
+                throw CLIError(command: "selftest", message: "resolved name mismatch: \(resolved)")
+            }
+            guard let written = try? String(contentsOfFile: cidPath, encoding: .utf8), written == name else {
+                throw CLIError(command: "selftest", message: "cidfile content wrong: \(String(describing: try? String(contentsOfFile: cidPath, encoding: .utf8)))")
+            }
+            try await ContainerService.delete(name, force: true)
+
+            // docker parity: refuse rather than overwrite an existing
+            // cidfile — and refuse BEFORE creating anything.
+            let otherName = "davit-selftest-cidfile-2"
+            try? await ContainerService.delete(otherName, force: true)
+            defer { Task { try? await ContainerService.delete(otherName, force: true) } }
+            var refused = false
+            do {
+                let dupInv = try RunCLI.parseArgs(["--name", otherName, "--cidfile", cidPath, "alpine:latest", "true"])
+                _ = try await RunCLI.execute(dupInv)
+            } catch let e as CLIError {
+                guard e.message.contains("container ID file") else { throw e }
+                refused = true
+            }
+            guard refused else {
+                throw CLIError(command: "selftest", message: "run should have refused an already-existing cidfile")
+            }
+            guard try await ContainerService.listContainers().first(where: { $0.id == otherName }) == nil else {
+                throw CLIError(command: "selftest", message: "cidfile refusal happened after create — container exists anyway")
+            }
+        }
+        await step("run: retainExitCode propagates the container's own exit code (review fix)") {
+            let name = "davit-selftest-exitcode"
+            try? await ContainerService.delete(name, force: true)
+            defer { Task { try? await ContainerService.delete(name, force: true) } }
+
+            let inv = try RunCLI.parseArgs(["--name", name, "alpine:latest", "sh", "-c", "exit 7"])
+            _ = try await RunCLI.execute(inv, retainExitCode: true)
+
+            // Not a poll: exitCode(for:) awaits the registered process.wait(),
+            // resolving once the init process (already running/exiting) stops.
+            let code = await ComposeExitCodes.shared.exitCode(for: name)
+            guard code == 7 else {
+                throw CLIError(command: "selftest", message: "retained exit code wrong: \(String(describing: code))")
+            }
+            try await ContainerService.delete(name, force: true)
+        }
+        await step("run: imageExists rethrows non-notFound errors, masks only .notFound (review fix)") {
+            // A malformed --platform value must surface as the real parse
+            // error, not be swallowed into a bare "false" the way a blanket
+            // catch would (masking a real problem as "image missing").
+            var rethrew = false
+            do {
+                _ = try await ContainerService.imageExists("alpine:latest", managementArgs: ["--platform", "not-a-real-platform"])
+            } catch {
+                rethrew = true
+            }
+            guard rethrew else {
+                throw CLIError(command: "selftest", message: "imageExists should have rethrown the bad --platform value, not returned a bool")
+            }
+
+            // A genuinely missing reference still resolves to false — the
+            // intended `--pull never` fast-fail path, not a thrown error.
+            let missing = try await ContainerService.imageExists("davit-selftest-does-not-exist:latest")
+            guard missing == false else {
+                throw CLIError(command: "selftest", message: "imageExists should be false for a nonexistent reference")
+            }
+
+            // The common case: alpine:latest is present locally by now
+            // (earlier steps already ran it) at the host's default platform.
+            let present = try await ContainerService.imageExists("alpine:latest")
+            guard present else {
+                throw CLIError(command: "selftest", message: "imageExists should be true for a present reference")
             }
         }
         await step("compose: parse subset + ordering + cycle rejection") {

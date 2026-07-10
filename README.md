@@ -144,16 +144,22 @@ Davit system start|stop          # bootstrap / tear down the container launchd s
 Davit platform install|remove    # download + verify Apple's signed pkg into an app-managed install root
 Davit registry login|list|logout # registry credentials (login reads the password from stdin)
 Davit run [flags] IMAGE [COMMAND…]    # docker-style single-container run
-    # flags precede IMAGE (docker convention; -- also ends flag parsing): -d|--detach, --rm,
-    # --pull missing|always|never, -e/--env, --env-file, -t/--tty, -u/--user, --uid, --gid,
-    # -w/--workdir, --ulimit, -c/--cpus, -m/--memory, --name, -p/--publish, -v/--volume, --mount,
-    # --tmpfs, --network, --entrypoint, -l/--label, --platform, --arch, --os, --cap-add, --cap-drop,
-    # --init, --read-only, --shm-size, --dns, --dns-search, --dns-option, --no-dns, --rosetta,
-    # --virtualization, --ssh, --cidfile, --verbose|-q|--quiet. Without -d, attaches to the new
-    # container's logs (no prefix) until Ctrl-C, which detaches only — the container keeps running
-    # (signals can't be forwarded to the guest process on this platform, unlike docker). -i/
-    # --interactive and docker flags with no platform mapping (--restart, --privileged, --add-host,
-    # --hostname, --gpus, …) are rejected outright rather than silently ignored.
+    # flags precede IMAGE (docker convention; -- also ends flag parsing, --help prints usage and
+    # exits 0): -d|--detach, --rm, --pull missing|always|never, -e/--env, --env-file, -t/--tty,
+    # -u/--user, --uid, --gid, -w/--workdir, --ulimit, -c/--cpus, -m/--memory, --name, -p/--publish,
+    # -v/--volume, --mount, --tmpfs, --network, --entrypoint, -l/--label, --platform, --arch, --os,
+    # --cap-add, --cap-drop, --init, --read-only, --shm-size, --dns, --dns-search, --dns-option,
+    # --no-dns, --rosetta, --virtualization, --ssh (forwards SSH_AUTH_SOCK from the host env),
+    # --cidfile (written once the container is up; refuses to overwrite an existing file, docker
+    # parity), --verbose|-q|--quiet. Clustered short flags (`-it`, `-dit`, …) are expanded the way
+    # docker itself accepts them. Without -d, attaches to the new container's logs (no prefix,
+    # status lines on stderr so stdout stays pure container output) until Ctrl-C, which detaches
+    # only — the container keeps running (signals can't be forwarded to the guest process on this
+    # platform, unlike docker) — and exits with the container's own exit code once it stops
+    # (docker parity); with --rm, removal happens right after the attach ends rather than racing a
+    # fast one-shot's daemon-side auto-remove, so output is never lost. -i/--interactive and docker
+    # flags with no platform mapping (--restart, --privileged, --add-host, --hostname, --gpus, …)
+    # are rejected outright rather than silently ignored.
 Davit compose <subcommand> [-f <file>] [--env-file <path>] [--profile <p>]… [service…]
     # subcommands: plan | up [-d|--detach] | down [-v|--volumes] | ps | logs [-f|--follow] [--tail <n>]
     #              stop | start | restart | pull | exec <service> <command…>
