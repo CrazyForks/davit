@@ -2,6 +2,7 @@ import AppKit
 import ContainerAPIClient
 import ContainerResource
 import Foundation
+import Logging
 
 /// Entry point. Normally launches the SwiftUI app; `davit exec <container-id>`
 /// instead attaches an interactive TTY shell to a container over the XPC API —
@@ -225,6 +226,11 @@ enum Main {
             semaphore.wait()
             return
         }
+        if args.count >= 2, args[1] == "run" {
+            // docker-style single-container run — RunCLI below.
+            RunCLI.run(Array(args.dropFirst(2)))
+            return
+        }
         if args.count >= 2, args[1] == "compose" {
             // Shared parse + dispatch for every compose subcommand — ComposeCLI below.
             ComposeCLI.run(Array(args.dropFirst(2)))
@@ -312,6 +318,28 @@ enum Main {
     }
 }
 
+/// stdout verbosity for one CLI invocation (compose decision 4 / plan I4b,
+/// reused by `davit run` / I6). `quiet` suppresses warnings and step/progress
+/// lines but never the final stderr error each mode's `run()` writes on
+/// failure; `verbose` adds diagnostics that are otherwise silent. GUI code
+/// never touches this — it calls Compose's functions directly with their
+/// default (no-op) diagnostic sinks.
+enum CLIOutputLevel { case quiet, normal, verbose }
+
+struct CLIOutput {
+    let level: CLIOutputLevel
+    func say(_ s: String) { if level != .quiet { print(s) } }
+    func warn(_ s: String) { if level != .quiet { print("warning: \(s)") } }
+    func verbose(_ s: String) { if level == .verbose { print(s) } }
+    /// Like `say` but without an added newline — pull's streamed lines carry their own.
+    func sayRaw(_ s: String) { if level != .quiet { print(s, terminator: "") } }
+    /// Like `say`/`warn` but to stderr — for status/banner lines a caller
+    /// whose stdout is reserved for something else (`davit run`'s attached
+    /// container log stream) must never mix into that stream.
+    func sayErr(_ s: String) { if level != .quiet { FileHandle.standardError.write(Data((s + "\n").utf8)) } }
+    func warnErr(_ s: String) { if level != .quiet { FileHandle.standardError.write(Data("warning: \(s)\n".utf8)) } }
+}
+
 /// `davit compose <sub>` — shared CLI plumbing for every compose subcommand
 /// (plan decision 12): one argv parser covering the common flags, per-
 /// subcommand extras, and the file-vs-service positional rule, plus the
@@ -321,8 +349,8 @@ enum Main {
 /// --env-file overrides. Usage problems exit 2, runtime failures exit 1.
 enum ComposeCLI {
     static let usage = """
-    usage: compose <subcommand> [-f <file>] [--env-file <path>] [--profile <name>]... [service...]
-      subcommands: plan | up [-d|--detach] | down [-v|--volumes] | ps
+    usage: compose <subcommand> [-f <file>] [--env-file <path>] [--profile <name>]... [--verbose|-q|--quiet] [service...]
+      subcommands: plan | up [-d|--detach] [--down-on-failure] | down [-v|--volumes] | ps
                    logs [-f|--follow] [--tail <n>] | stop | start | restart | pull
                    exec <service> <command...>
     """
@@ -332,7 +360,7 @@ enum ComposeCLI {
         var file: String? = nil
         var envFile: String? = nil
         var profiles: [String] = []
-        var flags: Set<String> = []      // canonical bool flags: "detach", "volumes", "follow"
+        var flags: Set<String> = []      // canonical bool flags: "detach", "volumes", "follow", "verbose", "quiet"
         var counts: [String: Int] = [:]  // canonical int flags: "tail"
         var services: [String] = []
         var command: [String] = []       // exec only: everything after the service
@@ -345,7 +373,7 @@ enum ComposeCLI {
     /// Per-subcommand flags, token → canonical name. These shadow the shared
     /// flags: for `logs`, -f means --follow, so its file flag is `--file` only.
     private static let boolFlags: [String: [String: String]] = [
-        "up": ["-d": "detach", "--detach": "detach"],
+        "up": ["-d": "detach", "--detach": "detach", "--down-on-failure": "down-on-failure"],
         "down": ["-v": "volumes", "--volumes": "volumes"],
         "logs": ["-f": "follow", "--follow": "follow"],
     ]
@@ -408,6 +436,12 @@ enum ComposeCLI {
                 inv.envFile = (value() as NSString).expandingTildeInPath
             } else if arg == "--profile" {
                 inv.profiles.append(value())
+            } else if arg == "--verbose" {
+                guard inline == nil else { usageExit("flag \(arg) takes no value") }
+                inv.flags.insert("verbose")
+            } else if arg == "-q" || arg == "--quiet" {
+                guard inline == nil else { usageExit("flag \(arg) takes no value") }
+                inv.flags.insert("quiet")
             } else if raw.hasPrefix("-") {
                 usageExit("unknown flag: \(raw)")
             } else if sub == "exec" {
@@ -439,6 +473,9 @@ enum ComposeCLI {
         if sub == "exec", inv.services.count != 1 || inv.command.isEmpty {
             usageExit("exec needs a service and a command")
         }
+        if inv.flags.contains("verbose"), inv.flags.contains("quiet") {
+            usageExit("--verbose and -q/--quiet are mutually exclusive")
+        }
         // COMPOSE_PROFILES is the fallback when no --profile was given (docker v2).
         if inv.profiles.isEmpty, let env = ProcessInfo.processInfo.environment["COMPOSE_PROFILES"] {
             inv.profiles = env.split(separator: ",").map(String.init).filter { !$0.isEmpty }
@@ -448,6 +485,11 @@ enum ComposeCLI {
 
     static func run(_ args: [String]) {
         let inv = parse(args)
+        let output = CLIOutput(level:
+            inv.flags.contains("verbose") ? .verbose : (inv.flags.contains("quiet") ? .quiet : .normal))
+        if output.level == .verbose, !LoggingConfig.explicitlySet {
+            LoggingConfig.level = .debug
+        }
         let discovered = inv.file == nil
             ? Compose.discoverFile(startingAt: FileManager.default.currentDirectoryPath) : nil
         guard let path = inv.file ?? discovered?.path else {
@@ -460,52 +502,111 @@ enum ComposeCLI {
             do {
                 let text = try String(contentsOfFile: path, encoding: .utf8)
                 let dir = URL(fileURLWithPath: path).deletingLastPathComponent()
-                let environment = try Compose.effectiveEnvironment(composeDir: dir.path, envFile: inv.envFile)
+                let (environment, envWarnings) = try Compose.effectiveEnvironment(composeDir: dir.path, envFile: inv.envFile)
+                for w in envWarnings { output.warn(w) }
                 let parsed = try Compose.parse(
                     text: text, projectName: dir.lastPathComponent, baseDir: dir.path, environment: environment)
+                // file/project for the subcommands that don't already show them
+                // as part of their own output (plan/up handle it inline below).
+                func verboseHeader() {
+                    output.verbose("file: \(path)")
+                    output.verbose("project: \(parsed.project)")
+                }
                 switch inv.subcommand {
                 case "plan", "up":
                     let plan = try parsed.selecting(services: inv.services, activeProfiles: inv.profiles)
-                    if autodiscovered { print("file: \(path)") }
-                    print("project: \(plan.project)")
-                    for v in plan.volumes { print("volume: \(v)") }
-                    for n in plan.networks { print("network: \(n)") }
-                    for s in plan.services { print("service: \(s.service)\n  \(s.cliPreview)") }
-                    if let w = discoveryWarning { print("warning: \(w)") }
-                    for w in plan.warnings { print("warning: \(w)") }
+                    // plan shows its listing at normal/verbose (that IS the command,
+                    // --quiet aside); up only echoes it under --verbose (design I4b:
+                    // "up echoes on verbose") — the equivalent `container run` lines
+                    // it's followed by are noisy on every routine `up` otherwise.
+                    let showPreview = inv.subcommand == "plan" || output.level == .verbose
+                    if showPreview {
+                        if autodiscovered || output.level == .verbose { output.say("file: \(path)") }
+                        output.say("project: \(plan.project)")
+                        for v in plan.volumes { output.say("volume: \(v)") }
+                        for n in plan.networks { output.say("network: \(n)") }
+                        for s in plan.services { output.say("service: \(s.service)\n  \(s.cliPreview)") }
+                    }
+                    if let w = discoveryWarning { output.warn(w) }
+                    for w in plan.warnings { output.warn(w) }
                     if inv.subcommand == "up" {
-                        let up = try await Compose.up(plan: plan) { step, done in
-                            if done { print("up: \(step.label) done") }
+                        let up: (warnings: [String], reused: Set<String>)
+                        let touched = TouchedServices()
+                        let createdNetworks = TouchedServices()
+                        do {
+                            up = try await Compose.up(
+                                plan: plan,
+                                diagnostic: { output.verbose($0) },
+                                onServiceTouched: { touched.insert($0) },
+                                onNetworkCreated: { createdNetworks.insert($0) }
+                            ) { step, done in
+                                if done { output.say("up: \(step.label) done") }
+                            }
+                        } catch {
+                            if inv.flags.contains("down-on-failure") {
+                                output.say("up failed — tearing down (--down-on-failure)")
+                                // Network/volume full-vs-partial gating is scoped the
+                                // same way the up itself was: a whole-project up (no
+                                // services named) tears the whole project down
+                                // (network/volumes per down's own full-teardown
+                                // rule); a service-scoped up leaves networks/volumes
+                                // alone. Either way, the actual CONTAINERS torn down
+                                // are limited to what THIS up run touched — plan.services
+                                // includes already-running services this up reused
+                                // untouched, and those must survive the teardown.
+                                let teardown = inv.services.isEmpty ? [] : plan.services.map(\.service)
+                                do {
+                                    let warnings = try await Compose.down(
+                                        plan: plan, services: teardown, removeVolumes: false,
+                                        limitContainersTo: touched.all,
+                                        limitNetworksTo: createdNetworks.all,
+                                        diagnostic: { output.verbose($0) }
+                                    ) { _, _ in }
+                                    for w in warnings { output.warn(w) }
+                                    // Surviving reused services may hold hosts
+                                    // entries for torn-down containers; re-sync.
+                                    for w in await Compose.syncProjectHosts(plan: plan) { output.warn(w) }
+                                } catch let teardownError {
+                                    let detail = (teardownError as? LocalizedError)?.errorDescription
+                                        ?? String(describing: teardownError)
+                                    FileHandle.standardError.write(Data("teardown after failed up did not complete cleanly (\(detail))\n".utf8))
+                                }
+                            }
+                            throw error
                         }
-                        for w in up.warnings { print("warning: \(w)") }
-                        print("compose up: ok")
+                        for w in up.warnings { output.warn(w) }
+                        output.say("compose up: ok")
                         if !inv.flags.contains("detach") {
                             // docker-compose behavior: a non-detached up stays
                             // attached to the selected services' logs — reused
                             // containers from now on only, so old runs' output
                             // doesn't replay.
-                            print("Attaching to logs (Ctrl-C detaches; containers keep running)")
+                            output.say("Attaching to logs (Ctrl-C detaches; containers keep running)")
                             try await Compose.logs(plan: plan, skipBacklogFor: up.reused, follow: true)
                         }
                     }
                 case "down":
+                    verboseHeader()
                     // The whole file, every profile active: teardown must not
                     // strand profile-gated containers (decision 13).
                     let warnings = try await Compose.down(
                         plan: parsed, services: inv.services,
-                        removeVolumes: inv.flags.contains("volumes")
+                        removeVolumes: inv.flags.contains("volumes"),
+                        diagnostic: { output.verbose($0) }
                     ) { step, done in
-                        if done { print("down: \(step.label) done") }
+                        if done { output.say("down: \(step.label) done") }
                     }
-                    for w in warnings { print("warning: \(w)") }
-                    print("compose down: ok")
+                    for w in warnings { output.warn(w) }
+                    output.say("compose down: ok")
                 case "logs":
+                    verboseHeader()
                     // Like down: the whole file, no profile filter — existing
                     // containers must stay visible even when profile-gated.
                     try await Compose.logs(
                         plan: parsed, services: inv.services,
                         tail: inv.counts["tail"], follow: inv.flags.contains("follow"))
                 case "stop", "start", "restart", "pull":
+                    verboseHeader()
                     // Docker parity: these scope to EXACTLY the named services
                     // — no dependency closure (stopping web must not stop a db
                     // other services still use; pull adds dependencies only
@@ -514,18 +615,19 @@ enum ComposeCLI {
                         services: inv.services, activeProfiles: inv.profiles, includeDependencies: false)
                     let sub = inv.subcommand
                     let report: @Sendable (Compose.StepKind, Bool) async -> Void = { step, done in
-                        if done { print("\(sub): \(step.label) done") }
+                        if done { output.say("\(sub): \(step.label) done") }
                     }
                     var warnings: [String] = []
                     switch sub {
                     case "stop": try await Compose.stop(plan: plan, progress: report)
-                    case "start": warnings = try await Compose.start(plan: plan, progress: report)
-                    case "restart": warnings = try await Compose.restart(plan: plan, progress: report)
-                    default: try await Compose.pull(plan: plan, progress: report)
+                    case "start": warnings = try await Compose.start(plan: plan, diagnostic: { output.verbose($0) }, progress: report)
+                    case "restart": warnings = try await Compose.restart(plan: plan, diagnostic: { output.verbose($0) }, progress: report)
+                    default: try await Compose.pull(plan: plan, progress: report, output: { output.sayRaw($0) })
                     }
-                    for w in warnings { print("warning: \(w)") }
-                    print("compose \(sub): ok")
+                    for w in warnings { output.warn(w) }
+                    output.say("compose \(sub): ok")
                 case "exec":
+                    verboseHeader()
                     // Whole-file plan like logs/down — an existing container of
                     // a profile-gated service must stay reachable. Resolution
                     // errors (unknown service, nothing running) exit 1 below;
@@ -534,10 +636,17 @@ enum ComposeCLI {
                     let container = try await Compose.runningContainer(plan: parsed, service: inv.services[0])
                     await ExecMode.run(containerID: container, argv: inv.command)
                 case "ps":
+                    verboseHeader()
                     // Like stop/start: `ps web` lists exactly web (docker parity).
                     let plan = try parsed.selecting(
                         services: inv.services, activeProfiles: inv.profiles, includeDependencies: false)
                     let records = try await Compose.ps(plan: plan)
+                    if inv.flags.contains("quiet") {
+                        // docker parity: `ps -q` prints bare container IDs (our
+                        // IDs are the names), one per line, nothing else.
+                        for r in records { print(r.container) }
+                        exit(0)
+                    }
                     let rows = [["SERVICE", "CONTAINER", "STATE", "PORTS"]]
                         + records.map { [$0.service, $0.container, $0.state, $0.ports] }
                     let widths = (0..<4).map { c in rows.map { $0[c].count }.max() ?? 0 }
@@ -553,6 +662,428 @@ enum ComposeCLI {
             } catch {
                 let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
                 FileHandle.standardError.write(Data("compose \(inv.subcommand) failed: \(message)\n".utf8)); exit(1)
+            }
+        }
+        semaphore.wait()
+    }
+}
+
+/// `davit run [flags] IMAGE [COMMAND...]` — docker-style single-container run
+/// (plan I6). Flags strictly precede IMAGE (docker convention); a bare `--`
+/// also ends flag parsing, docker-style. Recognized flags route into the same
+/// four arg arrays `ContainerService.runContainer` hands to Apple's
+/// `Flags.Process/Management/Resource` parsers — this layer only decides
+/// which bucket a token belongs to and whether it consumes a value (the
+/// parsers themselves handle repeats and validation); everything after IMAGE
+/// is the command argv, never parsed. `-d`/`--rm`/`--pull`/`-i`/`--verbose`/
+/// `--quiet` are Davit's own grammar, handled before the routing table is
+/// consulted. Usage problems exit 2, runtime failures exit 1 (ComposeCLI's
+/// convention).
+enum RunCLI {
+    enum Bucket { case process, management, resource }
+
+    /// flag token → (bucket, takesValue). Both spellings of a flag route to
+    /// the same bucket; the RAW token (not a canonical name) is what actually
+    /// gets appended to that bucket's argv, since Flags.Process/Management/
+    /// Resource parse the real docker spelling themselves. `--name` is
+    /// handled as its own branch below (not here) — its value is needed
+    /// up front to resolve the container's name before create.
+    static let routing: [String: (bucket: Bucket, takesValue: Bool)] = [
+        // process
+        "-e": (.process, true), "--env": (.process, true),
+        "--env-file": (.process, true),
+        "-t": (.process, false), "--tty": (.process, false),
+        "-u": (.process, true), "--user": (.process, true),
+        "--uid": (.process, true), "--gid": (.process, true),
+        "-w": (.process, true), "--workdir": (.process, true),
+        "--ulimit": (.process, true),
+        // resource
+        "-c": (.resource, true), "--cpus": (.resource, true),
+        "-m": (.resource, true), "--memory": (.resource, true),
+        // management
+        "-p": (.management, true), "--publish": (.management, true),
+        "-v": (.management, true), "--volume": (.management, true),
+        "--mount": (.management, true),
+        "--tmpfs": (.management, true),
+        "--network": (.management, true),
+        "--entrypoint": (.management, true),
+        "-l": (.management, true), "--label": (.management, true),
+        "--platform": (.management, true),
+        "--arch": (.management, true),
+        "--os": (.management, true),
+        "--cap-add": (.management, true),
+        "--cap-drop": (.management, true),
+        "--init": (.management, false),
+        "--read-only": (.management, false),
+        "--shm-size": (.management, true),
+        "--dns": (.management, true),
+        "--dns-search": (.management, true),
+        "--dns-option": (.management, true),
+        "--no-dns": (.management, false),
+        "--rosetta": (.management, false),
+        "--virtualization": (.management, false),
+        "--ssh": (.management, false),
+        // --cidfile is NOT routed here: unlike apple's own ContainerRun/
+        // ContainerCreate, Davit's create path (`Backend.runContainer` →
+        // `Utility.containerConfigFromFlags`) never reads
+        // `Flags.Management.cidfile` — writing the file is done by the CLI
+        // command layer itself. It's intercepted below (like --name) so
+        // `execute()` can write it after the container is actually created.
+    ]
+
+    /// Real `docker run` flags this platform has no equivalent for. Naming
+    /// them explicitly (rather than falling through to "unknown flag") gives
+    /// a docker-parity script an actionable message instead of a bare syntax
+    /// error, so it fails loudly instead of silently losing the setting.
+    static let unsupported: Set<String> = [
+        "--restart", "--add-host", "--privileged", "--hostname", "-h", "--domainname",
+        "--mac-address", "--gpus", "--device", "--device-cgroup-rule", "--link",
+        "--pid", "--ipc", "--uts", "--userns", "--security-opt", "--sysctl",
+        "--group-add", "--isolation", "--cgroup-parent", "--volumes-from",
+        "--stop-signal", "--stop-timeout", "--expose", "-P", "--publish-all",
+        "--log-driver", "--log-opt", "-a", "--attach",
+        "--health-cmd", "--health-interval", "--health-retries", "--health-timeout",
+        "--health-start-period", "--no-healthcheck",
+        "--memory-swap", "--memory-reservation", "--memory-swappiness", "--kernel-memory",
+        "--cpu-shares", "--cpuset-cpus", "--cpuset-mems", "--cpu-quota", "--cpu-period",
+        "--cpu-rt-runtime", "--cpu-rt-period", "--oom-kill-disable", "--oom-score-adj",
+        "--pids-limit", "--blkio-weight", "--blkio-weight-device",
+        "--device-read-bps", "--device-write-bps", "--device-read-iops", "--device-write-iops",
+    ]
+
+    static let usage = """
+    usage: run [flags] IMAGE [COMMAND...]
+      -d, --detach                  run detached; prints the container name (docker prints the ID; name==id here)
+      --rm                          remove the container once it stops
+      --pull missing|always|never   image pull policy (default: missing)
+      --verbose | -q, --quiet       per-run diagnostics (mutually exclusive)
+      --help                        show this usage and exit
+      flags must precede IMAGE (docker-style); `--` also ends flag parsing
+      docker-style flags: -e/--env, --env-file, -t/--tty, -u/--user, --uid, --gid,
+        -w/--workdir, --ulimit, -c/--cpus, -m/--memory, --name, -p/--publish,
+        -v/--volume, --mount, --tmpfs, --network, --entrypoint, -l/--label,
+        --platform, --arch, --os, --cap-add, --cap-drop, --init, --read-only,
+        --shm-size, --dns, --dns-search, --dns-option, --no-dns, --rosetta,
+        --virtualization, --ssh, --cidfile
+      -i/--interactive and docker flags with no platform mapping (--restart,
+      --privileged, --add-host, --hostname, --gpus, ...) are rejected — see README
+    """
+
+    struct Invocation {
+        var image = ""
+        var command: [String] = []
+        var process: [String] = []
+        var management: [String] = []
+        var resource: [String] = []
+        var name: String? = nil
+        var cidfile: String? = nil
+        var detach = false
+        var autoRemove = false
+        var pullPolicy = "missing"
+        var verbose = false
+        var quiet = false
+    }
+
+    /// Thrown by the pure `parseArgs` below instead of exiting the process —
+    /// keeps the routing logic selftest-able. `message == nil` prints the
+    /// bare usage line only (e.g. no IMAGE given at all). `isHelp` marks
+    /// `--help`: a success path (usage to stdout, exit 0), not a usage error.
+    struct ParseError: Error, Equatable {
+        let message: String?
+        var isHelp: Bool = false
+    }
+
+    /// Pure routing core: no I/O, no `exit()` — selftest calls this directly.
+    /// `parse(_:)` below is the process-exiting shell `run()` actually uses.
+    static func parseArgs(_ args: [String]) throws -> Invocation {
+        var args = args
+        var inv = Invocation()
+        var i = 0
+        while i < args.count {
+            let raw = args[i]
+            if raw == "--" {
+                i += 1
+                break
+            }
+            var arg = raw
+            var inline: String? = nil
+            if raw.hasPrefix("--"), let eq = raw.firstIndex(of: "=") {
+                arg = String(raw[..<eq])
+                inline = String(raw[raw.index(after: eq)...])
+            }
+            func value() throws -> String {
+                if let v = inline { return v }
+                guard i + 1 < args.count else { throw ParseError(message: "flag \(arg) needs a value") }
+                i += 1
+                return args[i]
+            }
+            if arg == "-d" || arg == "--detach" {
+                guard inline == nil else { throw ParseError(message: "flag \(arg) takes no value") }
+                inv.detach = true
+            } else if arg == "--rm" {
+                guard inline == nil else { throw ParseError(message: "flag \(arg) takes no value") }
+                inv.autoRemove = true
+            } else if arg == "--pull" {
+                let v = try value()
+                guard ["missing", "always", "never"].contains(v) else {
+                    throw ParseError(message: "invalid --pull value: \(v) (want missing|always|never)")
+                }
+                inv.pullPolicy = v
+            } else if arg == "-i" || arg == "--interactive" {
+                throw ParseError(message: "interactive runs aren't supported; start detached, then `Davit exec <name>`")
+            } else if arg == "--name" {
+                let v = try value()
+                inv.name = v
+                inv.management.append(contentsOf: [arg, v])
+            } else if arg == "--cidfile" {
+                // Intercepted rather than routed (unlike apple's own CLI,
+                // Davit's create path never reads Flags.Management.cidfile) —
+                // execute() writes it itself once the container exists.
+                inv.cidfile = try value()
+            } else if arg == "--verbose" {
+                guard inline == nil else { throw ParseError(message: "flag \(arg) takes no value") }
+                inv.verbose = true
+            } else if arg == "-q" || arg == "--quiet" {
+                guard inline == nil else { throw ParseError(message: "flag \(arg) takes no value") }
+                inv.quiet = true
+            } else if arg == "--help" {
+                guard inline == nil else { throw ParseError(message: "flag \(arg) takes no value") }
+                throw ParseError(message: nil, isHelp: true)
+            } else if unsupported.contains(arg) {
+                let hint = arg == "-h" ? "; for help, use --help" : ""
+                throw ParseError(message: "docker flag \(arg) has no equivalent on this platform (apple/container doesn't support it) — remove it or adjust the parity script\(hint)")
+            } else if let route = routing[arg] {
+                if route.takesValue {
+                    let v = try value()
+                    switch route.bucket {
+                    case .process: inv.process.append(contentsOf: [arg, v])
+                    case .management: inv.management.append(contentsOf: [arg, v])
+                    case .resource: inv.resource.append(contentsOf: [arg, v])
+                    }
+                } else {
+                    guard inline == nil else { throw ParseError(message: "flag \(arg) takes no value") }
+                    switch route.bucket {
+                    case .process: inv.process.append(arg)
+                    case .management: inv.management.append(arg)
+                    case .resource: inv.resource.append(arg)
+                    }
+                }
+            } else if raw.hasPrefix("-"), !raw.hasPrefix("--"), raw.count > 2,
+                      raw.dropFirst().allSatisfy({ "dtiq".contains($0) }) {
+                // Docker's clustered short flags (`-it`, `-ti`, `-dit`, ...) —
+                // expand into individual tokens and splice them back into the
+                // stream so each one re-dispatches through the branches
+                // above. Docker users overwhelmingly type `-it`, not `-i -t`
+                // separately; this is in particular what surfaces the
+                // tailored `-i` rejection instead of a bare "unknown flag:
+                // -it". Any letter outside {d,t,i,q} (Davit's only no-value
+                // short flags) falls through to the plain unknown-flag error
+                // below, naming the whole cluster.
+                args.replaceSubrange(i...i, with: raw.dropFirst().map { "-\($0)" })
+                continue
+            } else if raw.hasPrefix("-"), raw != "-" {
+                throw ParseError(message: "unknown flag: \(raw)")
+            } else {
+                inv.image = raw
+                i += 1
+                break
+            }
+            i += 1
+        }
+        if inv.image.isEmpty {
+            guard i < args.count else { throw ParseError(message: nil) }
+            inv.image = args[i]
+            i += 1
+        }
+        inv.command = i < args.count ? Array(args[i...]) : []
+        if inv.verbose, inv.quiet {
+            throw ParseError(message: "--verbose and -q/--quiet are mutually exclusive")
+        }
+        return inv
+    }
+
+    /// `parseArgs` wrapped for real CLI use: usage problems print to stderr
+    /// and exit 2, naming the offending token where there is one. `--help` is
+    /// the one success path: usage to stdout, exit 0 (general CLI convention
+    /// docker itself follows — a well-known flag must never look like a
+    /// syntax error).
+    static func parse(_ args: [String]) -> Invocation {
+        do {
+            return try parseArgs(args)
+        } catch let error as ParseError {
+            if error.isHelp {
+                print(usage); exit(0)
+            }
+            let prefix = error.message.map { $0 + "\n" } ?? ""
+            FileHandle.standardError.write(Data((prefix + usage + "\n").utf8)); exit(2)
+        } catch {
+            FileHandle.standardError.write(Data((usage + "\n").utf8)); exit(2)
+        }
+    }
+
+    /// Resolves the container name, applies `--pull`, and creates+starts the
+    /// container — everything `run()` needs that a selftest can also drive
+    /// directly (no `exit()` in here, unlike `run()` itself). Returns the
+    /// resolved name (mirrors `Backend.runContainer`'s own id computation:
+    /// an empty --name value is treated like "not given", random id — same
+    /// as the GUI Run sheet). `retainExitCode` (foreground runs only, set by
+    /// `run()`) registers the init process with `ComposeExitCodes` so the
+    /// caller can propagate the container's own exit code once it stops.
+    static func execute(
+        _ inv: Invocation, output: CLIOutput = CLIOutput(level: .normal), retainExitCode: Bool = false
+    ) async throws -> String {
+        let resolvedName = Utility.createContainerID(name: (inv.name?.isEmpty == true) ? nil : inv.name)
+
+        // docker parity: refuse up front rather than silently clobbering
+        // another run's cidfile (or one left behind by a container that's
+        // still around) — mirrors docker's client-side cidfile.go check.
+        let cidfile = (inv.cidfile?.isEmpty == false) ? inv.cidfile : nil
+        if let cidfile, FileManager.default.fileExists(atPath: cidfile) {
+            throw CLIError(command: "run", message: "container ID file found, make sure the other container isn't running or delete \(cidfile)")
+        }
+
+        switch inv.pullPolicy {
+        case "always":
+            output.verbose("pulling \(inv.image) (--pull always)")
+            try await ContainerService.pullImage(inv.image) { _ in }
+        case "never":
+            guard try await ContainerService.imageExists(inv.image, managementArgs: inv.management) else {
+                throw CLIError(command: "run", message: "image not present locally and --pull never was given: \(inv.image)")
+            }
+        default:
+            break  // "missing" (default): the create path's own fetch-if-absent already covers this
+        }
+
+        output.verbose("resolved name: \(resolvedName)")
+        do {
+            try await ContainerService.runContainer(
+                image: inv.image,
+                name: resolvedName,
+                processArgs: inv.process,
+                managementArgs: inv.management,
+                resourceArgs: inv.resource,
+                commandArgs: inv.command,
+                autoRemove: inv.autoRemove,
+                retainExitCode: retainExitCode
+            )
+        } catch {
+            // create succeeded but start failed (port conflict etc.): with
+            // --rm, a container that never ran must not survive to block the
+            // name — daemon autoRemove only reaps STOPPED containers, and the
+            // foreground path strips it anyway. Without --rm docker leaves the
+            // created container behind; we match that.
+            if inv.autoRemove {
+                try? await ContainerService.delete(resolvedName, force: true)
+            }
+            throw error
+        }
+
+        // Apple's own ContainerRun writes this right after bootstrap starts,
+        // with the same 0644/create-only semantics; erroring here (rather
+        // than silently swallowing a write failure) matches "cidfile accepted
+        // means cidfile honored" — and, like apple's own catch block around
+        // this same step, a write failure tears the just-created container
+        // back down rather than leaving an orphaned running container behind
+        // a "run failed" message.
+        if let cidfile {
+            let ok = FileManager.default.createFile(
+                atPath: cidfile, contents: Data(resolvedName.utf8), attributes: [.posixPermissions: 0o644])
+            guard ok else {
+                try? await ContainerService.delete(resolvedName, force: true)
+                throw CLIError(command: "run", message: "failed to write cidfile at \(cidfile)")
+            }
+        }
+        return resolvedName
+    }
+
+    static func run(_ args: [String]) {
+        let inv = parse(args)
+        let output = CLIOutput(level: inv.quiet ? .quiet : (inv.verbose ? .verbose : .normal))
+        if output.level == .verbose, !LoggingConfig.explicitlySet {
+            LoggingConfig.level = .debug
+        }
+        let semaphore = DispatchSemaphore(value: 0)
+        Task.detached {
+            do {
+                // Foreground --rm: don't hand removal to the daemon, which
+                // reaps an auto-remove container the instant its init process
+                // exits — a fast one-shot can race that reap against the log
+                // attach below and lose all output (docker run --rm always
+                // shows it). Create non-removing instead and delete it
+                // ourselves once the attach is done; still gone afterwards,
+                // same as docker, just sequenced so the logs are never lost.
+                let deferRemoval = inv.autoRemove && !inv.detach
+                var createInv = inv
+                if deferRemoval { createInv.autoRemove = false }
+
+                // retainExitCode only matters for the attach path below (a
+                // detached run never waits on it) — always requesting it
+                // there lets a foreground run propagate the container's own
+                // exit code (docker parity) instead of always exiting 0.
+                let resolvedName = try await execute(createInv, output: output, retainExitCode: !inv.detach)
+
+                if inv.detach {
+                    // The primary, script-parsed output of `-d` (docker parity)
+                    // — printed unconditionally, --quiet notwithstanding, same
+                    // as docker itself never suppresses the printed ID.
+                    print(resolvedName)
+                    exit(0)
+                }
+
+                // Attach: stream this one container's logs, no prefix (I6
+                // design) — reuses compose's per-stream follow core so the
+                // tail/readability-handler/exit-detection logic isn't
+                // duplicated. Ctrl-C only detaches: signals can't be
+                // forwarded to the guest process on this platform (no exec
+                // signal delivery), so the container keeps running — a
+                // documented divergence from docker, not a bug. Banner and
+                // the no-stream warning go to stderr — stdout here is
+                // reserved for the container's own log content, so
+                // `davit run img cmd | consumer` never sees status noise
+                // ahead of (or interleaved with) real output.
+                output.sayErr("Attaching to logs (Ctrl-C detaches; container keeps running)")
+                var sigintSource: DispatchSourceSignal?
+                if deferRemoval {
+                    // Removal is deferred to after the attach; Ctrl-C ends the
+                    // process before that line runs, so the container would
+                    // silently outlive --rm. Can't forward signals to the guest
+                    // on this platform — be honest instead of silent.
+                    signal(SIGINT, SIG_IGN)
+                    let src = DispatchSource.makeSignalSource(signal: SIGINT)
+                    src.setEventHandler {
+                        FileHandle.standardError.write(Data(
+                            "\ndetached — container \(resolvedName) keeps running and will NOT be auto-removed (--rm removal runs after the attach): remove it later with `container delete \(resolvedName)`\n".utf8))
+                        exit(130)
+                    }
+                    src.resume()
+                    sigintSource = src
+                }
+                if let handle = await Compose.openLogHandle(resolvedName) {
+                    // Best-effort: a follow error must not skip the exit-code
+                    // fetch / --rm cleanup below.
+                    try? await Compose.followLogStreams(
+                        [Compose.LogStream(prefix: "", name: resolvedName, handle: handle, backlog: true)],
+                        tail: nil, follow: true,
+                        output: { FileHandle.standardOutput.write(Data($0.utf8)) }
+                    )
+                } else {
+                    output.warnErr("no log stream available for \(resolvedName)")
+                }
+
+                // followLogStreams only returns once the container has
+                // stopped, so the registered wait (retainExitCode above)
+                // resolves immediately here.
+                let exitCode = await ComposeExitCodes.shared.exitCode(for: resolvedName) ?? 0
+                sigintSource?.cancel()
+                if deferRemoval {
+                    try? await ContainerService.delete(resolvedName, force: true)
+                }
+                exit(exitCode)
+            } catch {
+                let message = (error as? CLIError)?.message
+                    ?? (error as? LocalizedError)?.errorDescription
+                    ?? String(describing: error)
+                FileHandle.standardError.write(Data("run failed: \(message)\n".utf8)); exit(1)
             }
         }
         semaphore.wait()
@@ -699,6 +1230,338 @@ enum SelfTest {
             let final = try await SystemConfigStore.load()
             guard final.effective["dns"]?["domain"] == nil || final.effective["dns"]?["domain"] is NSNull else {
                 throw CLIError(command: "selftest", message: "override not removed on revert")
+            }
+        }
+        await step("log level: DAVIT_LOG_LEVEL parsing") {
+            // Pure — LoggingSystem.bootstrap itself traps if called twice, so
+            // this exercises the parsing function bootstrapLogging() uses
+            // rather than re-bootstrapping the process' actual logger.
+            guard LoggingConfig.parseLevel(nil) == (.info, true) else {
+                throw CLIError(command: "selftest", message: "unset DAVIT_LOG_LEVEL should default to info")
+            }
+            guard LoggingConfig.parseLevel("") == (.info, true) else {
+                throw CLIError(command: "selftest", message: "empty DAVIT_LOG_LEVEL should default to info")
+            }
+            let cases: [(String, Logger.Level)] = [
+                ("trace", .trace), ("DEBUG", .debug), ("Info", .info), ("notice", .notice),
+                ("WARNING", .warning), ("error", .error), ("Critical", .critical),
+            ]
+            for (raw, expected) in cases {
+                guard LoggingConfig.parseLevel(raw) == (expected, true) else {
+                    throw CLIError(command: "selftest", message: "DAVIT_LOG_LEVEL=\(raw) parsed wrong: \(LoggingConfig.parseLevel(raw))")
+                }
+            }
+            guard LoggingConfig.parseLevel("bogus") == (.info, false) else {
+                throw CLIError(command: "selftest", message: "invalid DAVIT_LOG_LEVEL should fall back to info and flag ok=false")
+            }
+        }
+        await step("run: pure routing (RunCLI.parseArgs)") {
+            // Pure — no exit(), no async work; RunCLI.parse() is the process-
+            // exiting shell around this that a live CLI round-trip covers.
+            let full = try RunCLI.parseArgs([
+                "--env", "FOO=bar", "--cpus", "2", "--name", "x", "-p", "80:80",
+                "alpine", "echo", "hi",
+            ])
+            guard full.process == ["--env", "FOO=bar"] else {
+                throw CLIError(command: "selftest", message: "process bucket wrong: \(full.process)")
+            }
+            guard full.resource == ["--cpus", "2"] else {
+                throw CLIError(command: "selftest", message: "resource bucket wrong: \(full.resource)")
+            }
+            guard full.management == ["--name", "x", "-p", "80:80"] else {
+                throw CLIError(command: "selftest", message: "management bucket wrong: \(full.management)")
+            }
+            guard full.name == "x", full.image == "alpine", full.command == ["echo", "hi"] else {
+                throw CLIError(command: "selftest", message: "name/image/command wrong: \(full.name ?? "nil") \(full.image) \(full.command)")
+            }
+
+            // Boolean flags in each bucket append just the flag token, no value.
+            let bools = try RunCLI.parseArgs(["-t", "--init", "--rosetta", "alpine"])
+            guard bools.process == ["-t"], bools.management == ["--init", "--rosetta"], bools.image == "alpine", bools.command.isEmpty else {
+                throw CLIError(command: "selftest", message: "boolean routing wrong: \(bools.process) \(bools.management) \(bools.image) \(bools.command)")
+            }
+
+            // Davit-side flags never reach the bucket arrays.
+            let davit = try RunCLI.parseArgs(["-d", "--rm", "--pull", "always", "--verbose", "alpine"])
+            guard davit.detach, davit.autoRemove, davit.pullPolicy == "always", davit.verbose,
+                  davit.process.isEmpty, davit.management.isEmpty, davit.resource.isEmpty
+            else { throw CLIError(command: "selftest", message: "Davit-side flag parsing wrong: \(davit)") }
+
+            // `--flag=value` inline spelling.
+            let inline = try RunCLI.parseArgs(["--cpus=2", "--name=foo", "alpine"])
+            guard inline.resource == ["--cpus", "2"], inline.management == ["--name", "foo"], inline.name == "foo" else {
+                throw CLIError(command: "selftest", message: "inline =value wrong: \(inline.resource) \(inline.management) \(inline.name ?? "nil")")
+            }
+
+            // `--` ends flag parsing early; the very next token is IMAGE even
+            // if it looks like a flag.
+            let dashdash = try RunCLI.parseArgs(["--env", "A=1", "--", "--not-a-flag", "arg2"])
+            guard dashdash.process == ["--env", "A=1"], dashdash.image == "--not-a-flag", dashdash.command == ["arg2"] else {
+                throw CLIError(command: "selftest", message: "-- termination wrong: \(dashdash.process) \(dashdash.image) \(dashdash.command)")
+            }
+
+            // Everything after IMAGE is verbatim command argv — never parsed,
+            // even flag-shaped or explicitly-unsupported-looking tokens.
+            let postImage = try RunCLI.parseArgs(["alpine", "--restart", "always", "-e", "X=1"])
+            guard postImage.image == "alpine", postImage.command == ["--restart", "always", "-e", "X=1"],
+                  postImage.process.isEmpty, postImage.management.isEmpty
+            else { throw CLIError(command: "selftest", message: "post-IMAGE argv was reparsed: \(postImage.command)") }
+
+            // Unknown flag.
+            do {
+                _ = try RunCLI.parseArgs(["--bogus", "alpine"])
+                throw CLIError(command: "selftest", message: "unknown flag not rejected")
+            } catch let e as RunCLI.ParseError {
+                guard e.message == "unknown flag: --bogus" else {
+                    throw CLIError(command: "selftest", message: "unknown flag message wrong: \(e.message ?? "nil")")
+                }
+            }
+
+            // -i/--interactive hard error.
+            do {
+                _ = try RunCLI.parseArgs(["-i", "alpine"])
+                throw CLIError(command: "selftest", message: "-i not rejected")
+            } catch let e as RunCLI.ParseError {
+                guard e.message?.contains("interactive runs aren't supported") == true else {
+                    throw CLIError(command: "selftest", message: "-i message wrong: \(e.message ?? "nil")")
+                }
+            }
+
+            // Docker flags with no platform mapping.
+            do {
+                _ = try RunCLI.parseArgs(["--restart", "always", "alpine"])
+                throw CLIError(command: "selftest", message: "--restart not rejected")
+            } catch let e as RunCLI.ParseError {
+                guard e.message?.contains("--restart") == true, e.message?.contains("no equivalent") == true else {
+                    throw CLIError(command: "selftest", message: "--restart message wrong: \(e.message ?? "nil")")
+                }
+            }
+
+            // A value-taking flag at argv end.
+            do {
+                _ = try RunCLI.parseArgs(["--name"])
+                throw CLIError(command: "selftest", message: "trailing --name without a value not rejected")
+            } catch let e as RunCLI.ParseError {
+                guard e.message == "flag --name needs a value" else {
+                    throw CLIError(command: "selftest", message: "trailing-value message wrong: \(e.message ?? "nil")")
+                }
+            }
+
+            // Bare `run` (no IMAGE at all): usage only, no message.
+            do {
+                _ = try RunCLI.parseArgs([])
+                throw CLIError(command: "selftest", message: "empty argv not rejected")
+            } catch let e as RunCLI.ParseError {
+                guard e.message == nil else {
+                    throw CLIError(command: "selftest", message: "empty-argv error should carry no message: \(e.message ?? "nil")")
+                }
+            }
+
+            // --verbose and --quiet are mutually exclusive.
+            do {
+                _ = try RunCLI.parseArgs(["--verbose", "--quiet", "alpine"])
+                throw CLIError(command: "selftest", message: "--verbose --quiet combo not rejected")
+            } catch let e as RunCLI.ParseError {
+                guard e.message?.contains("mutually exclusive") == true else {
+                    throw CLIError(command: "selftest", message: "verbose/quiet message wrong: \(e.message ?? "nil")")
+                }
+            }
+
+            // Invalid --pull value.
+            do {
+                _ = try RunCLI.parseArgs(["--pull", "sometimes", "alpine"])
+                throw CLIError(command: "selftest", message: "invalid --pull value not rejected")
+            } catch let e as RunCLI.ParseError {
+                guard e.message?.contains("invalid --pull value") == true else {
+                    throw CLIError(command: "selftest", message: "--pull message wrong: \(e.message ?? "nil")")
+                }
+            }
+
+            // --cidfile is intercepted, not routed into the management bucket
+            // (review fix: apple's create path never reads
+            // Flags.Management.cidfile, so leaving it there silently
+            // dropped it — execute() now writes it itself).
+            let cid = try RunCLI.parseArgs(["--cidfile", "/tmp/davit-selftest.cid", "--name", "x", "alpine"])
+            guard cid.cidfile == "/tmp/davit-selftest.cid", cid.management == ["--name", "x"] else {
+                throw CLIError(command: "selftest", message: "--cidfile routing wrong: cidfile=\(cid.cidfile ?? "nil") management=\(cid.management)")
+            }
+
+            // Docker's clustered short flags (review fix): `-it`/`-ti`/`-dit`
+            // must surface the tailored -i rejection, not a bare "unknown
+            // flag". A cluster with no `i` (`-dt`) expands and routes as if
+            // written separately.
+            for cluster in ["-it", "-ti", "-dit", "-tid"] {
+                do {
+                    _ = try RunCLI.parseArgs([cluster, "alpine"])
+                    throw CLIError(command: "selftest", message: "\(cluster) not rejected as interactive")
+                } catch let e as RunCLI.ParseError {
+                    guard e.message?.contains("interactive runs aren't supported") == true else {
+                        throw CLIError(command: "selftest", message: "\(cluster) message wrong: \(e.message ?? "nil")")
+                    }
+                }
+            }
+            let dtCluster = try RunCLI.parseArgs(["-dt", "alpine"])
+            guard dtCluster.detach, dtCluster.process == ["-t"] else {
+                throw CLIError(command: "selftest", message: "-dt cluster expansion wrong: detach=\(dtCluster.detach) process=\(dtCluster.process)")
+            }
+            // A cluster with an unrecognized letter still falls through to
+            // the plain unknown-flag error, naming the whole token.
+            do {
+                _ = try RunCLI.parseArgs(["-itx", "alpine"])
+                throw CLIError(command: "selftest", message: "-itx not rejected")
+            } catch let e as RunCLI.ParseError {
+                guard e.message == "unknown flag: -itx" else {
+                    throw CLIError(command: "selftest", message: "-itx message wrong: \(e.message ?? "nil")")
+                }
+            }
+
+            // --help is a success path: usage only, no error message.
+            do {
+                _ = try RunCLI.parseArgs(["--help"])
+                throw CLIError(command: "selftest", message: "--help did not throw")
+            } catch let e as RunCLI.ParseError {
+                guard e.isHelp, e.message == nil else {
+                    throw CLIError(command: "selftest", message: "--help parse result wrong: isHelp=\(e.isHelp) message=\(e.message ?? "nil")")
+                }
+            }
+
+            // -h (docker's "hostname", no equivalent here) hints at --help
+            // rather than just declaring itself unsupported.
+            do {
+                _ = try RunCLI.parseArgs(["-h", "myhost", "alpine"])
+                throw CLIError(command: "selftest", message: "-h not rejected")
+            } catch let e as RunCLI.ParseError {
+                guard e.message?.contains("--help") == true else {
+                    throw CLIError(command: "selftest", message: "-h message missing --help hint: \(e.message ?? "nil")")
+                }
+            }
+        }
+        await step("run: live run with --name/--env/--publish/--label, then --rm one-shot") {
+            let name = "davit-selftest-run"
+            try? await ContainerService.delete(name, force: true)
+            defer { Task { try? await ContainerService.delete(name, force: true) } }
+
+            let inv = try RunCLI.parseArgs([
+                "--name", name, "--env", "FOO=bar", "--publish", "18080:80",
+                "--label", "team=davit", "alpine:latest", "sleep", "120",
+            ])
+            _ = try await RunCLI.execute(inv)
+
+            let record = try await ContainerService.listContainers().first { $0.id == name }
+            guard record?.isRunning == true else {
+                throw CLIError(command: "selftest", message: "run: container not running after run")
+            }
+            guard record?.configuration.initProcess?.environment?.contains("FOO=bar") == true else {
+                throw CLIError(command: "selftest", message: "run: --env not applied: \(record?.configuration.initProcess?.environment ?? [])")
+            }
+            guard record?.configuration.labels?["team"] == "davit" else {
+                throw CLIError(command: "selftest", message: "run: --label not applied: \(record?.configuration.labels ?? [:])")
+            }
+            guard let port = record?.configuration.publishedPorts?.first, port.hostPort == 18080, port.containerPort == 80 else {
+                throw CLIError(command: "selftest", message: "run: --publish not applied: \(record?.configuration.publishedPorts ?? [])")
+            }
+            try await ContainerService.delete(name, force: true)
+
+            // --rm one-shot: the container must be gone once it exits, no
+            // manual cleanup — poll rather than sleep a fixed amount.
+            let rmName = "davit-selftest-run-rm"
+            try? await ContainerService.delete(rmName, force: true)
+            let rmInv = try RunCLI.parseArgs(["--name", rmName, "--rm", "alpine:latest", "true"])
+            _ = try await RunCLI.execute(rmInv)
+            var gone = false
+            for _ in 0..<30 {
+                if try await ContainerService.listContainers().first(where: { $0.id == rmName }) == nil {
+                    gone = true
+                    break
+                }
+                try await Task.sleep(for: .seconds(1))
+            }
+            guard gone else {
+                try? await ContainerService.delete(rmName, force: true)
+                throw CLIError(command: "selftest", message: "run: --rm container still present 30s after a one-shot exit")
+            }
+        }
+        await step("run: --cidfile write + refuse-if-exists (review fix)") {
+            let name = "davit-selftest-cidfile"
+            try? await ContainerService.delete(name, force: true)
+            defer { Task { try? await ContainerService.delete(name, force: true) } }
+
+            let cidPath = FileManager.default.temporaryDirectory
+                .appendingPathComponent("davit-selftest-\(UUID().uuidString).cid").path
+            defer { try? FileManager.default.removeItem(atPath: cidPath) }
+
+            let inv = try RunCLI.parseArgs(["--name", name, "--cidfile", cidPath, "alpine:latest", "sleep", "60"])
+            let resolved = try await RunCLI.execute(inv)
+            guard resolved == name else {
+                throw CLIError(command: "selftest", message: "resolved name mismatch: \(resolved)")
+            }
+            guard let written = try? String(contentsOfFile: cidPath, encoding: .utf8), written == name else {
+                throw CLIError(command: "selftest", message: "cidfile content wrong: \(String(describing: try? String(contentsOfFile: cidPath, encoding: .utf8)))")
+            }
+            try await ContainerService.delete(name, force: true)
+
+            // docker parity: refuse rather than overwrite an existing
+            // cidfile — and refuse BEFORE creating anything.
+            let otherName = "davit-selftest-cidfile-2"
+            try? await ContainerService.delete(otherName, force: true)
+            defer { Task { try? await ContainerService.delete(otherName, force: true) } }
+            var refused = false
+            do {
+                let dupInv = try RunCLI.parseArgs(["--name", otherName, "--cidfile", cidPath, "alpine:latest", "true"])
+                _ = try await RunCLI.execute(dupInv)
+            } catch let e as CLIError {
+                guard e.message.contains("container ID file") else { throw e }
+                refused = true
+            }
+            guard refused else {
+                throw CLIError(command: "selftest", message: "run should have refused an already-existing cidfile")
+            }
+            guard try await ContainerService.listContainers().first(where: { $0.id == otherName }) == nil else {
+                throw CLIError(command: "selftest", message: "cidfile refusal happened after create — container exists anyway")
+            }
+        }
+        await step("run: retainExitCode propagates the container's own exit code (review fix)") {
+            let name = "davit-selftest-exitcode"
+            try? await ContainerService.delete(name, force: true)
+            defer { Task { try? await ContainerService.delete(name, force: true) } }
+
+            let inv = try RunCLI.parseArgs(["--name", name, "alpine:latest", "sh", "-c", "exit 7"])
+            _ = try await RunCLI.execute(inv, retainExitCode: true)
+
+            // Not a poll: exitCode(for:) awaits the registered process.wait(),
+            // resolving once the init process (already running/exiting) stops.
+            let code = await ComposeExitCodes.shared.exitCode(for: name)
+            guard code == 7 else {
+                throw CLIError(command: "selftest", message: "retained exit code wrong: \(String(describing: code))")
+            }
+            try await ContainerService.delete(name, force: true)
+        }
+        await step("run: imageExists rethrows non-notFound errors, masks only .notFound (review fix)") {
+            // A malformed --platform value must surface as the real parse
+            // error, not be swallowed into a bare "false" the way a blanket
+            // catch would (masking a real problem as "image missing").
+            var rethrew = false
+            do {
+                _ = try await ContainerService.imageExists("alpine:latest", managementArgs: ["--platform", "not-a-real-platform"])
+            } catch {
+                rethrew = true
+            }
+            guard rethrew else {
+                throw CLIError(command: "selftest", message: "imageExists should have rethrown the bad --platform value, not returned a bool")
+            }
+
+            // A genuinely missing reference still resolves to false — the
+            // intended `--pull never` fast-fail path, not a thrown error.
+            let missing = try await ContainerService.imageExists("davit-selftest-does-not-exist:latest")
+            guard missing == false else {
+                throw CLIError(command: "selftest", message: "imageExists should be false for a nonexistent reference")
+            }
+
+            // The common case: alpine:latest is present locally by now
+            // (earlier steps already ran it) at the host's default platform.
+            let present = try await ContainerService.imageExists("alpine:latest")
+            guard present else {
+                throw CLIError(command: "selftest", message: "imageExists should be true for a present reference")
             }
         }
         await step("compose: parse subset + ordering + cycle rejection") {
@@ -981,14 +1844,41 @@ enum SelfTest {
             else { throw CLIError(command: "selftest", message: ":+ operator wrong") }
             _ = warned  // reserved for future warning assertions
 
-            // CRLF .env: values must not keep a trailing \r; quotes must strip.
             let fm = FileManager.default
+            // Cross-file env_file precedence: a file redefining X then
+            // referencing it must see its OWN value (compose-go), not an
+            // earlier file's.
+            let xDir = fm.temporaryDirectory.appendingPathComponent("davit-selftest-xfile-\(UUID().uuidString)")
+            try fm.createDirectory(at: xDir, withIntermediateDirectories: true)
+            defer { try? fm.removeItem(at: xDir) }
+            try "X=one\n".write(to: xDir.appendingPathComponent("a.env"), atomically: true, encoding: .utf8)
+            try "X=two\nY=${X}\n".write(to: xDir.appendingPathComponent("b.env"), atomically: true, encoding: .utf8)
+            let xPlan = try Compose.parse(
+                text: "services: {s: {image: alpine, env_file: [a.env, b.env]}}",
+                projectName: "x", baseDir: xDir.path)
+            guard xPlan.services[0].processArgs.contains("Y=two") else {
+                throw CLIError(command: "selftest", message: "cross-file env_file precedence wrong: \(xPlan.services[0].processArgs)")
+            }
+
+            // Inline comments: quoted values end at the close quote (rest
+            // dropped, single-quote stays literal); unquoted cut at " #".
+            let cDir = fm.temporaryDirectory.appendingPathComponent("davit-selftest-cmt-\(UUID().uuidString)")
+            try fm.createDirectory(at: cDir, withIntermediateDirectories: true)
+            defer { try? fm.removeItem(at: cDir) }
+            try "PASS='p$wd' # login\nPRICE=10 # in $USD\n".write(
+                to: cDir.appendingPathComponent(".env"), atomically: true, encoding: .utf8)
+            let cEnv = try Compose.effectiveEnvironment(composeDir: cDir.path, processEnvironment: [:])
+            guard cEnv.environment["PASS"] == "p$wd", cEnv.environment["PRICE"] == "10" else {
+                throw CLIError(command: "selftest", message: "inline comment handling wrong: \(cEnv.environment)")
+            }
+
+            // CRLF .env: values must not keep a trailing \r; quotes must strip.
             let crlfDir = fm.temporaryDirectory.appendingPathComponent("davit-selftest-crlf-\(UUID().uuidString)")
             try fm.createDirectory(at: crlfDir, withIntermediateDirectories: true)
             defer { try? fm.removeItem(at: crlfDir) }
             try "A=plain\r\nB=\"quoted\"\r\n".write(
                 to: crlfDir.appendingPathComponent(".env"), atomically: true, encoding: .utf8)
-            let env = try Compose.effectiveEnvironment(composeDir: crlfDir.path, processEnvironment: [:])
+            let env = try Compose.effectiveEnvironment(composeDir: crlfDir.path, processEnvironment: [:]).environment
             guard env["A"] == "plain", env["B"] == "quoted" else {
                 throw CLIError(command: "selftest", message: "CRLF .env parsed wrong: \(env)")
             }
@@ -1009,20 +1899,47 @@ enum SelfTest {
             EMPTY=
               SPACED  =  padded
             SHARED=dotenv
+            A=1
+            B=${A}2
+            HOMEPATH="${HOME}/test"
+            HOMELITERAL='${HOME}/test'
+            REF=${SHARED}
             not a key-value line
             """.write(to: dir.appendingPathComponent(".env"), atomically: true, encoding: .utf8)
 
             // default <dir>/.env layered under the process env — process wins
-            let env = try Compose.effectiveEnvironment(
-                composeDir: dir.path, processEnvironment: ["SHARED": "process", "PROC_ONLY": "1"])
+            let (env, envWarnings) = try Compose.effectiveEnvironment(
+                composeDir: dir.path,
+                processEnvironment: ["SHARED": "process", "PROC_ONLY": "1", "HOME": "/Users/tester"])
             guard env["TAG"] == "3.19", env["EXPORTED"] == "yes",
                   env["QUOTED"] == "q value", env["SINGLE"] == "s value",
                   env["EMPTY"] == "", env["SPACED"] == "padded",
                   env["SHARED"] == "process", env["PROC_ONLY"] == "1"
             else { throw CLIError(command: "selftest", message: "effectiveEnvironment wrong: \(env)") }
+            guard envWarnings.isEmpty else {
+                throw CLIError(command: "selftest", message: "unexpected dotenv warnings: \(envWarnings)")
+            }
+            // left-to-right self-reference within the same file: A defined
+            // above, B references it on the very next line
+            guard env["B"] == "12" else {
+                throw CLIError(command: "selftest", message: "dotenv self-reference wrong: \(env["B"] ?? "nil")")
+            }
+            // user's exact scenario: double/unquoted interpolates at load time,
+            // single-quoted stays literal (docker parity)
+            guard env["HOMEPATH"] == "/Users/tester/test" else {
+                throw CLIError(command: "selftest", message: "dotenv interpolation wrong: \(env["HOMEPATH"] ?? "nil")")
+            }
+            guard env["HOMELITERAL"] == "${HOME}/test" else {
+                throw CLIError(command: "selftest", message: "single-quoted dotenv value was interpolated: \(env["HOMELITERAL"] ?? "nil")")
+            }
+            // process environment wins the lookup over this file's own
+            // same-named entry, even when referenced from a later line
+            guard env["REF"] == "process" else {
+                throw CLIError(command: "selftest", message: "process-env-wins lookup wrong: \(env["REF"] ?? "nil")")
+            }
 
             // absent default .env → just the process env; missing explicit file → error
-            guard try Compose.effectiveEnvironment(composeDir: altDir.path, processEnvironment: ["A": "b"]) == ["A": "b"] else {
+            guard try Compose.effectiveEnvironment(composeDir: altDir.path, processEnvironment: ["A": "b"]).environment == ["A": "b"] else {
                 throw CLIError(command: "selftest", message: "absent default .env should yield the process env")
             }
             do {
@@ -1034,8 +1951,18 @@ enum SelfTest {
             try "ONLY=here\n".write(to: altDir.appendingPathComponent("alt.env"), atomically: true, encoding: .utf8)
             guard try Compose.effectiveEnvironment(
                 composeDir: dir.path, envFile: altDir.appendingPathComponent("alt.env").path,
-                processEnvironment: [:]) == ["ONLY": "here"]
+                processEnvironment: [:]).environment == ["ONLY": "here"]
             else { throw CLIError(command: "selftest", message: "--env-file override wrong") }
+            // ${X:?msg} inside a .env value throws just like YAML substitution
+            let reqDir = fm.temporaryDirectory.appendingPathComponent("davit-selftest-envreq-\(UUID().uuidString)")
+            try fm.createDirectory(at: reqDir, withIntermediateDirectories: true)
+            defer { try? fm.removeItem(at: reqDir) }
+            try "NEEDED=${MISSING:?must be set}\n".write(
+                to: reqDir.appendingPathComponent(".env"), atomically: true, encoding: .utf8)
+            do {
+                _ = try Compose.effectiveEnvironment(composeDir: reqDir.path, processEnvironment: [:])
+                throw CLIError(command: "selftest", message: ".env :? unset not rejected")
+            } catch Compose.Error.requiredVariable(name: "MISSING", message: "must be set") { /* expected */ }
 
             // interpolation: every string value, resolved before per-key parsing
             let yaml = """
@@ -1097,6 +2024,7 @@ enum SelfTest {
             try """
             BASE=one
             SHARED=base
+            INTERP=${BASE}-two
             RAW=${NOT_INTERPOLATED}
             """.write(to: dir.appendingPathComponent("base.env"), atomically: true, encoding: .utf8)
             try """
@@ -1104,13 +2032,19 @@ enum SelfTest {
             EXTRA=two
             OVERLAP=file
             FALLBACK=fromfile
+            CROSS=${BASE}-cross
             """.write(to: dir.appendingPathComponent("sub/more.env"), atomically: true, encoding: .utf8)
 
             // All three entry forms; precedence: earlier files < later files <
-            // environment:. File contents are NOT interpolated (RAW stays
-            // literal — a deliberate deviation: compose v2 expands ${VAR} in
-            // env-file values); a bare environment KEY unset in the effective
-            // env falls back to the env_file value without a warning.
+            // environment:. File contents ARE interpolated at load time now
+            // (docker parity — INTERP self-references BASE within the same
+            // file); an unset reference still warns instead of throwing (RAW).
+            // CROSS (in the later file) self-references BASE (defined in the
+            // earlier file) — compose-go parity, the confirmed review-fix
+            // regression: each env_file's lookup layers under every earlier
+            // file's already-parsed values, not just that file's own. A bare
+            // environment KEY unset in the effective env falls back to the
+            // env_file value without a warning.
             let plan = try Compose.parse(text: """
             services:
               app:
@@ -1122,19 +2056,19 @@ enum SelfTest {
                 environment: [OVERLAP=explicit, FALLBACK]
             """, projectName: "envfile", baseDir: dir.path)
             guard plan.services[0].processArgs == [
-                "--env", "BASE=one", "--env", "EXTRA=two", "--env", "FALLBACK=fromfile",
-                "--env", "RAW=${NOT_INTERPOLATED}", "--env", "SHARED=later",
+                "--env", "BASE=one", "--env", "CROSS=one-cross", "--env", "EXTRA=two", "--env", "FALLBACK=fromfile",
+                "--env", "INTERP=one-two", "--env", "RAW=", "--env", "SHARED=later",
                 "--env", "OVERLAP=explicit",
             ] else { throw CLIError(command: "selftest", message: "env_file merge wrong: \(plan.services[0].processArgs)") }
-            guard plan.warnings.isEmpty else {
-                throw CLIError(command: "selftest", message: "env_file should be warning-free: \(plan.warnings)")
+            guard plan.warnings.count == 1, plan.warnings[0].contains("\"NOT_INTERPOLATED\"") else {
+                throw CLIError(command: "selftest", message: "env_file interpolation warning wrong: \(plan.warnings)")
             }
             // string form; missing file without required: false is an error
             let single = try Compose.parse(
                 text: "services: {app: {image: alpine, env_file: base.env}}",
                 projectName: "envfile", baseDir: dir.path)
             guard single.services[0].processArgs == [
-                "--env", "BASE=one", "--env", "RAW=${NOT_INTERPOLATED}", "--env", "SHARED=base",
+                "--env", "BASE=one", "--env", "INTERP=one-two", "--env", "RAW=", "--env", "SHARED=base",
             ] else { throw CLIError(command: "selftest", message: "env_file string form wrong: \(single.services[0].processArgs)") }
             do {
                 _ = try Compose.parse(
@@ -1589,6 +2523,138 @@ enum SelfTest {
             }
             await cleanup()
         }
+        await step("compose: --down-on-failure teardown primitives") {
+            // I3 fixture: a starts fine; b's image can never resolve, so up
+            // fails partway through with a already running — exactly the
+            // situation --down-on-failure exists for. The flag's CLI-level
+            // orchestration (Main.swift ComposeCLI.run) just composes these
+            // two calls: default (no flag) leaves a running; with the flag
+            // it also runs the down below. (The flag parsing/print/rethrow
+            // itself is exercised by a CLI round-trip, not here — the CLI
+            // dispatcher exits the process on completion.)
+            let names = ["davit-selftest-dof-a", "davit-selftest-dof-b"]
+            func cleanup() async {
+                for n in names { try? await ContainerService.delete(n, force: true) }
+            }
+            await cleanup()  // leftovers from a previous aborted run
+
+            let plan = try Compose.parse(text: """
+            name: davit-selftest-dof
+            services:
+              a:
+                image: alpine:latest
+                command: ["sleep", "600"]
+              b:
+                image: davit-selftest-nonexistent-tag:does-not-exist
+            """, projectName: "ignored")
+
+            do {
+                var upFailed = false
+                do {
+                    _ = try await Compose.up(plan: plan) { _, _ in }
+                } catch {
+                    upFailed = true
+                }
+                guard upFailed else {
+                    throw CLIError(command: "selftest", message: "up with an unresolvable image did not fail")
+                }
+                let a1 = try await ContainerService.listContainers().first { $0.id == "davit-selftest-dof-a" }
+                guard a1?.isRunning == true else {
+                    throw CLIError(command: "selftest", message: "default (no flag) up should leave a running after b fails")
+                }
+
+                // What --down-on-failure does next: a whole-project down
+                // (no services named), same as the CLI teardown path when
+                // the failed up wasn't itself scoped to specific services.
+                _ = try await Compose.down(plan: plan, removeVolumes: false) { _, _ in }
+                guard try await Compose.ps(plan: plan).isEmpty else {
+                    throw CLIError(command: "selftest", message: "teardown after failed up should leave no project containers")
+                }
+            } catch {
+                await cleanup()
+                throw error
+            }
+            await cleanup()
+        }
+        await step("compose: --down-on-failure spares reused services (I5 review fix)") {
+            // Regression for the confirmed review finding: a whole-project
+            // --down-on-failure teardown must not destroy services a PRIOR
+            // up already had running and this up merely reused. a, b come up
+            // healthy first; a second up against a plan that also adds c
+            // (unresolvable image) reuses a/b untouched and fails on c —
+            // onServiceTouched must report only "c", and a down scoped via
+            // limitContainersTo: touched must leave a/b running.
+            let names = ["davit-selftest-dof2-a", "davit-selftest-dof2-b"]
+            func cleanup() async {
+                for n in names { try? await ContainerService.delete(n, force: true) }
+            }
+            await cleanup()  // leftovers from a previous aborted run
+
+            let basePlan = try Compose.parse(text: """
+            name: davit-selftest-dof2
+            services:
+              a:
+                image: alpine:latest
+                command: ["sleep", "600"]
+              b:
+                image: alpine:latest
+                command: ["sleep", "600"]
+            """, projectName: "ignored")
+            let extendedPlan = try Compose.parse(text: """
+            name: davit-selftest-dof2
+            services:
+              a:
+                image: alpine:latest
+                command: ["sleep", "600"]
+              b:
+                image: alpine:latest
+                command: ["sleep", "600"]
+              c:
+                image: davit-selftest-nonexistent-tag:does-not-exist
+            """, projectName: "ignored")
+
+            do {
+                _ = try await Compose.up(plan: basePlan) { _, _ in }
+                for n in ["davit-selftest-dof2-a", "davit-selftest-dof2-b"] {
+                    let record = try await ContainerService.listContainers().first { $0.id == n }
+                    guard record?.isRunning == true else {
+                        throw CLIError(command: "selftest", message: "\(n) should be running before the second up")
+                    }
+                }
+
+                let touched = TouchedServices()
+                var upFailed = false
+                do {
+                    _ = try await Compose.up(plan: extendedPlan, onServiceTouched: { touched.insert($0) }) { _, _ in }
+                } catch {
+                    upFailed = true
+                }
+                guard upFailed else {
+                    throw CLIError(command: "selftest", message: "up with an unresolvable image did not fail")
+                }
+                guard touched.all == ["c"] else {
+                    throw CLIError(command: "selftest", message: "onServiceTouched should report only [\"c\"], got \(touched.all.sorted())")
+                }
+
+                _ = try await Compose.down(
+                    plan: extendedPlan, removeVolumes: false, limitContainersTo: touched.all
+                ) { _, _ in }
+
+                for n in ["davit-selftest-dof2-a", "davit-selftest-dof2-b"] {
+                    let record = try await ContainerService.listContainers().first { $0.id == n }
+                    guard record?.isRunning == true else {
+                        throw CLIError(command: "selftest", message: "\(n) (reused, untouched by the failed up) should survive a scoped teardown")
+                    }
+                }
+                guard try await ContainerService.listContainers().first(where: { $0.id == "davit-selftest-dof2-c" }) == nil else {
+                    throw CLIError(command: "selftest", message: "c should not exist after the failed up")
+                }
+            } catch {
+                await cleanup()
+                throw error
+            }
+            await cleanup()
+        }
         await step("compose: logs (non-follow)") {
             let names = ["davit-selftest-logs-a", "davit-selftest-logs-longer"]
             func cleanup() async {
@@ -1818,6 +2884,17 @@ final class Atomic: @unchecked Sendable {
         get { lock.lock(); defer { lock.unlock() }; return _value }
         set { lock.lock(); defer { lock.unlock() }; _value = newValue }
     }
+}
+
+/// Lock-protected accumulator of service names an `up` actually (re)created
+/// this invocation, fed by Compose.up's `onServiceTouched` callback. A
+/// `--down-on-failure` teardown intersects against this so it never tears
+/// down a service the up merely found already running and reused.
+final class TouchedServices: @unchecked Sendable {
+    private let lock = NSLock()
+    private var names = Set<String>()
+    func insert(_ name: String) { lock.lock(); names.insert(name); lock.unlock() }
+    var all: Set<String> { lock.lock(); defer { lock.unlock() }; return names }
 }
 
 enum ExecMode {

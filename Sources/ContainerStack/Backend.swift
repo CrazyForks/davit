@@ -1,6 +1,7 @@
 import AppKit
 import ArgumentParser
 import ContainerAPIClient
+import ContainerizationError
 import ContainerizationOCI
 import ContainerPersistence
 import ContainerPlugin
@@ -47,10 +48,63 @@ enum ContainerBinary {
     /// Must run before any ContainerAPIClient/ContainerPlugin API is touched:
     /// InstallRoot.defaultPath is computed relative to the executable, which is wrong
     /// inside an app bundle. Pin it (and let user config in app root win) via env.
+    /// Also the one place swift-log gets bootstrapped (see bootstrapLogging below) —
+    /// Main.main() calls this before dispatching to any subcommand or the app.
     static func bootstrapEnvironment() {
+        bootstrapLogging()
         guard ProcessInfo.processInfo.environment[InstallRoot.environmentName] == nil,
               let resolved = resolve() else { return }
         setenv(InstallRoot.environmentName, resolved.installRoot, 1)
+    }
+
+    /// `LoggingSystem.bootstrap` may run exactly once per process (a second call
+    /// traps), so it happens here, unconditionally, before anything can create a
+    /// `Logger`. `Backend.log` (below) is a `static let`, lazily initialized on
+    /// first access like all Swift globals — since this function runs first in
+    /// Main.main() and nothing above it touches `Backend.log`, that first access
+    /// always happens after the bootstrap and picks up LoggingConfig.level.
+    private static func bootstrapLogging() {
+        let raw = ProcessInfo.processInfo.environment["DAVIT_LOG_LEVEL"]
+        let (level, ok) = LoggingConfig.parseLevel(raw)
+        if !ok {
+            FileHandle.standardError.write(Data("DAVIT_LOG_LEVEL: unrecognized level \"\(raw ?? "")\" — using info\n".utf8))
+        }
+        LoggingConfig.level = level
+        // A rejected value falls back to fully-default behavior (as if unset)
+        // so --verbose can still bump the level to .debug — only a value that
+        // actually parsed counts as the user explicitly choosing a level.
+        LoggingConfig.explicitlySet = ok && raw?.isEmpty == false
+        LoggingSystem.bootstrap { label in
+            var handler = StreamLogHandler.standardError(label: label)
+            handler.logLevel = LoggingConfig.level
+            return handler
+        }
+    }
+}
+
+/// DAVIT_LOG_LEVEL parsing + the mutable level `bootstrapLogging`'s handler
+/// factory reads from. `--verbose` (ComposeCLI) bumps `level` to `.debug` before
+/// `Backend.log` is ever created, unless the env var was explicit — factored out
+/// of ContainerBinary so it stays pure and selftest-able without re-bootstrapping
+/// swift-log (which would trap the process).
+enum LoggingConfig {
+    nonisolated(unsafe) static var level: Logger.Level = .info
+    nonisolated(unsafe) static var explicitlySet = false
+
+    /// nil/empty (unset) → `.info`, no warning; unrecognized → `.info` + `ok: false`
+    /// so the caller can warn once. Case-insensitive over swift-log's level names.
+    static func parseLevel(_ raw: String?) -> (level: Logger.Level, ok: Bool) {
+        guard let raw, !raw.isEmpty else { return (.info, true) }
+        switch raw.lowercased() {
+        case "trace": return (.trace, true)
+        case "debug": return (.debug, true)
+        case "info": return (.info, true)
+        case "notice": return (.notice, true)
+        case "warning": return (.warning, true)
+        case "error": return (.error, true)
+        case "critical": return (.critical, true)
+        default: return (.info, false)
+        }
     }
 }
 
@@ -140,6 +194,31 @@ enum ContainerService {
         reference.contains("/containerization/vminit") || reference.contains("/container-builder-shim/")
     }
 
+    /// Whether `reference` already resolves to a locally present image AT the
+    /// requested platform variant — the same two-step check `ClientImage.fetch`
+    /// does internally (reference lookup, then `match.config(for:)` to confirm
+    /// the specific platform's config is present) before falling back to a
+    /// pull. Used by `davit run --pull never` to fail fast instead of silently
+    /// degrading to `missing`'s pull-if-absent behavior. `managementArgs` are
+    /// the raw `--platform`/`--os`/`--arch` flags (docker-style, may be empty)
+    /// so this matches exactly what the create path would request; only a
+    /// `.notFound` from either step means "not present" — any other error
+    /// (unreachable registry config, corrupt store, ...) is rethrown rather
+    /// than masked as a plain "false".
+    static func imageExists(_ reference: String, managementArgs: [String] = []) async throws -> Bool {
+        let config = try await Backend.systemConfig()
+        do {
+            let image = try await ClientImage.get(reference: reference, containerSystemConfig: config)
+            let management = try Flags.Management.parse(managementArgs)
+            let platform = try DefaultPlatform.resolveWithDefaults(
+                platform: management.platform, os: management.os, arch: management.arch, log: Backend.log)
+            _ = try await image.config(for: platform)
+            return true
+        } catch let error as ContainerizationError where error.isCode(.notFound) {
+            return false
+        }
+    }
+
     static func listNetworks() async throws -> [NetworkRecord] {
         try await NetworkClient().list().map(NetworkRecord.init(resource:))
     }
@@ -203,7 +282,15 @@ enum ContainerService {
         guard container.status != .running else { return }
         let io = try ProcessIO.create(tty: container.configuration.initProcess.terminal, interactive: false, detach: true)
         do {
-            let process = try await client.bootstrap(id: id, stdio: io.stdio, dynamicEnv: [:])
+            // Mirrors apple's own ContainerRun/ContainerStart: the daemon-side
+            // ssh-forwarding lookup (RuntimeService.sshAuthSocketHostUrl) only
+            // fires when the container's own config has `ssh` set, so handing
+            // this along unconditionally is a no-op for every non-ssh container.
+            var dynamicEnv: [String: String] = [:]
+            if let sshAuthSock = ProcessInfo.processInfo.environment["SSH_AUTH_SOCK"] {
+                dynamicEnv["SSH_AUTH_SOCK"] = sshAuthSock
+            }
+            let process = try await client.bootstrap(id: id, stdio: io.stdio, dynamicEnv: dynamicEnv)
             // Register BEFORE start: a fast one-shot can exit — and the
             // apiserver reap its runtime client — before a wait issued
             // afterwards lands, losing the exit code (see ComposeExitCodes).
@@ -261,7 +348,9 @@ enum ContainerService {
         managementArgs: [String],
         resourceArgs: [String],
         commandArgs: [String],
-        retainExitCode: Bool = false
+        autoRemove: Bool = false,
+        retainExitCode: Bool = false,
+        progressUpdate: @escaping ProgressUpdateHandler = { _ in }
     ) async throws {
         do {
             // The run path auto-pulls missing images; stage helper credentials first.
@@ -286,14 +375,14 @@ enum ContainerService {
                 registry: registry,
                 imageFetch: imageFetch,
                 containerSystemConfig: config,
-                progressUpdate: { _ in },
+                progressUpdate: progressUpdate,
                 log: Backend.log
             )
 
             let client = ContainerClient()
             try await client.create(
                 configuration: configuration,
-                options: ContainerCreateOptions(autoRemove: false),
+                options: ContainerCreateOptions(autoRemove: autoRemove),
                 kernel: kernel,
                 initImage: initImage
             )

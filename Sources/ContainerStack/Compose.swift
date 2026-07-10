@@ -172,9 +172,22 @@ enum Compose {
 
     /// KEY=VALUE dotenv subset: whitespace trimmed, blank and #-comment lines
     /// skipped, optional `export ` prefix, one matching pair of single or
-    /// double quotes stripped from the value — no escape processing beyond that.
-    private static func parseDotEnv(text: String) -> [String: String] {
+    /// double quotes stripped from the value — no escape processing beyond
+    /// that. Docker parity (load-time interpolation): a single-quoted value
+    /// stays literal; every other value is run through the existing
+    /// `substitute` grammar immediately, left-to-right, against `lookup =
+    /// processEnvironment (wins) ∪ this file's own previously-defined
+    /// entries` — so a later line can reference an earlier one, but the
+    /// caller's environment always wins a naming conflict. `${X:?msg}` throws
+    /// like it does during YAML substitution; other warnings (e.g. an unset
+    /// variable) are returned rather than printed, so the caller can route
+    /// them into whatever warnings channel it has.
+    private static func parseDotEnv(
+        text: String, processEnvironment: [String: String], fallback: [String: String] = [:]
+    ) throws -> (values: [String: String], warnings: [String]) {
         var out: [String: String] = [:]
+        var warnings: [String] = []
+        var warned = Set<String>()
         for line in text.split(whereSeparator: \.isNewline) {
             // .whitespacesAndNewlines: CRLF files otherwise leave a trailing
             // \r in every value and defeat the quote stripping below.
@@ -185,30 +198,54 @@ enum Compose {
             let key = entry[..<eq].trimmingCharacters(in: .whitespaces)
             guard !key.isEmpty else { continue }
             var value = entry[entry.index(after: eq)...].trimmingCharacters(in: .whitespacesAndNewlines)
-            if value.count >= 2,
-               (value.hasPrefix("\"") && value.hasSuffix("\"")) || (value.hasPrefix("'") && value.hasSuffix("'")) {
-                value = String(value.dropFirst().dropLast())
+            var singleQuoted = false
+            // Docker dotenv: a quoted value ends at the MATCHING close quote
+            // (anything after, e.g. an inline comment, is dropped), and an
+            // unquoted value is cut at the first whitespace-preceded "#".
+            // Suffix-testing the whole line instead would mis-handle
+            // `PASS='p$wd' # login` and interpolate a "literal" value.
+            if let quote = value.first, quote == "'" || quote == "\"" {
+                let inner = value.dropFirst()
+                if let close = inner.firstIndex(of: quote) {
+                    singleQuoted = (quote == "'")
+                    value = String(inner[..<close])
+                }
+            } else if let hash = value.firstIndex(of: "#"),
+                      hash != value.startIndex,
+                      value[value.index(before: hash)].isWhitespace {
+                value = String(value[..<hash]).trimmingCharacters(in: .whitespaces)
+            }
+            if !singleQuoted {
+                // Precedence (compose-go): process/effective env > this file's
+                // earlier lines > earlier env_files (the fallback tier).
+                let lookup = fallback
+                    .merging(out) { _, own in own }
+                    .merging(processEnvironment) { _, process in process }
+                value = try substitute(value, environment: lookup, warned: &warned, warnings: &warnings)
             }
             out[key] = value
         }
-        return out
+        return (out, warnings)
     }
 
     /// The environment interpolation sees: `<composeDir>/.env` (or an explicit
     /// env file) layered under the process environment — process wins (docker
     /// precedence). A missing default `.env` is simply absent; a missing
-    /// explicit file is an error.
+    /// explicit file is an error. `.env` values are interpolated at load time
+    /// (see `parseDotEnv`); any warnings from that pass are returned alongside
+    /// the resolved environment so callers can surface them.
     static func effectiveEnvironment(
         composeDir: String,
         envFile: String? = nil,
         processEnvironment: [String: String] = ProcessInfo.processInfo.environment
-    ) throws -> [String: String] {
+    ) throws -> (environment: [String: String], warnings: [String]) {
         let path = envFile ?? URL(fileURLWithPath: composeDir).appendingPathComponent(".env").path
         guard let text = try? String(contentsOfFile: path, encoding: .utf8) else {
             if envFile != nil { throw Error.envFileNotFound(path) }
-            return processEnvironment
+            return (processEnvironment, [])
         }
-        return parseDotEnv(text: text).merging(processEnvironment) { _, process in process }
+        let (values, warnings) = try parseDotEnv(text: text, processEnvironment: processEnvironment)
+        return (values.merging(processEnvironment) { _, process in process }, warnings)
     }
 
     /// Replaces `${VAR}` in every string VALUE of the loaded YAML tree (never
@@ -427,12 +464,14 @@ enum Compose {
 
         // env_file: string, list, or {path, required} entries — paths resolve
         // against the compose file's directory; contents load through the
-        // dotenv parser and are NOT interpolated — a deliberate deviation:
-        // compose v2 expands ${VAR} inside env-file values (single-quoted
-        // ones excepted), here every value passes through literally. Later
-        // files override earlier ones; environment: below overrides them
-        // all. A missing file is an error unless the entry says
-        // `required: false`.
+        // same dotenv parser as .env, so values are interpolated at load
+        // time too (docker parity — single-quoted values stay literal), each
+        // file's own lookup layering the effective environment under its own
+        // previously-defined entries AND every earlier env_file's already-parsed
+        // values (compose-go parity — a later file can reference an earlier
+        // one's variables). Later files override earlier ones; environment:
+        // below overrides them all. A missing file is an error unless the
+        // entry says `required: false`.
         var envFileSpecs: [(path: String, required: Bool)] = []
         func envFileSpec(_ entry: Any) {
             if let m = entry as? [String: Any] {
@@ -466,7 +505,14 @@ enum Compose {
                 if required { throw Error.envFileNotFound(resolved) }
                 continue
             }
-            fileEnv.merge(parseDotEnv(text: text)) { _, later in later }
+            // Lookup precedence (compose-go): effective environment, then this
+            // file's own earlier lines, then earlier env_files — a file
+            // redefining X then referencing it must see its own value, not an
+            // earlier file's.
+            let (values, fileWarnings) = try parseDotEnv(
+                text: text, processEnvironment: environment, fallback: fileEnv)
+            fileEnv.merge(values) { _, later in later }
+            warnings += fileWarnings
         }
 
         // environment: map or list form; its keys beat env_file entries
@@ -960,6 +1006,11 @@ extension Compose {
         }
     }
 
+    /// Verbose-only diagnostic sink threaded through up/down/start/restart —
+    /// CLI wires this to stdout under `--verbose`; the GUI and non-verbose CLI
+    /// paths use the default no-op, so this changes no observable behavior there.
+    typealias Diagnostic = @Sendable (String) -> Void
+
     /// Bring the plan up: create missing named volumes and networks, then create
     /// and start each service in dependency order, honoring depends_on conditions
     /// before each start (service_healthy probes the dependency's healthcheck,
@@ -972,8 +1023,15 @@ extension Compose {
     /// Returns the sync warnings plus the set of services that were reused
     /// untouched — the CLI's log attach skips those containers' backlog, like
     /// docker only replays history for containers the up actually created.
+    /// `onServiceTouched` fires just before a service is (re)created — never
+    /// for the reuse branch — so a caller that throws partway through this up
+    /// (e.g. --down-on-failure) knows exactly which services it, rather than
+    /// an earlier up, is responsible for tearing down.
     static func up(
         plan: Plan,
+        diagnostic: @escaping Diagnostic = { _ in },
+        onServiceTouched: @escaping @Sendable (String) -> Void = { _ in },
+        onNetworkCreated: @escaping @Sendable (String) -> Void = { _ in },
         progress: @escaping @Sendable (StepKind, _ done: Bool) async -> Void
     ) async throws -> (warnings: [String], reused: Set<String>) {
         let existingVolumes = Set((try? await ContainerService.listVolumes())?.map(\.name) ?? [])
@@ -987,6 +1045,7 @@ extension Compose {
         for network in plan.networks where !existingNetworks.contains(network) {
             await progress(.network(network), false)
             try await ContainerService.createNetwork(name: network, subnet: nil, internal: false)
+            onNetworkCreated(network)
             await progress(.network(network), true)
         }
         // Undeclared networks referenced by services (we warned) — create those too.
@@ -994,6 +1053,7 @@ extension Compose {
         for network in referenced.subtracting(plan.networks).subtracting(existingNetworks).sorted() {
             await progress(.network(network), false)
             try await ContainerService.createNetwork(name: network, subnet: nil, internal: false)
+            onNetworkCreated(network)
             await progress(.network(network), true)
         }
 
@@ -1036,7 +1096,7 @@ extension Compose {
                     guard let hc = depPlan.healthcheck else {
                         throw Error.missingHealthcheck(service: svc.service, dependency: dep)
                     }
-                    try await waitHealthy(service: dep, container: depPlan.name, healthcheck: hc)
+                    try await waitHealthy(service: dep, container: depPlan.name, healthcheck: hc, diagnostic: diagnostic)
                 case .completedSuccessfully:
                     // The registry only knows containers started by this process,
                     // i.e. earlier in this same up (snapshots carry no exit code).
@@ -1049,11 +1109,16 @@ extension Compose {
             }
 
             await progress(.service(svc.service), false)
+            diagnostic("\(svc.service): \(svc.cliPreview)")
             if let record = preexisting[svc.name], !record.isRunning {
                 // Ours, but not running (stopped, or created-but-start-failed) —
                 // recreate from the current plan rather than diffing config.
                 try await ContainerService.delete(svc.name, force: true)
             }
+            // The run path auto-pulls a missing image; reuse pull's own tracker
+            // to turn that stream into the same coarse lines pull's output uses.
+            let tracker = PullTracker()
+            onServiceTouched(svc.service)
             try await ContainerService.runContainer(
                 image: svc.image,
                 name: svc.name,
@@ -1061,12 +1126,15 @@ extension Compose {
                 managementArgs: svc.managementArgs,
                 resourceArgs: svc.resourceArgs,
                 commandArgs: svc.commandArgs,
-                retainExitCode: needsExitCode.contains(svc.service)
+                retainExitCode: needsExitCode.contains(svc.service),
+                progressUpdate: { events in
+                    for line in tracker.consume(events) { diagnostic("\(svc.service): \(line)") }
+                }
             )
             await progress(.service(svc.service), true)
         }
 
-        return (await syncProjectHosts(plan: plan), reused)
+        return (await syncProjectHosts(plan: plan, diagnostic: diagnostic), reused)
     }
 
     /// Compose service names never resolve from inside containers on this
@@ -1092,7 +1160,7 @@ extension Compose {
         record.configuration.labels?[projectLabel] == project
     }
 
-    static func syncProjectHosts(plan: Plan) async -> [String] {
+    static func syncProjectHosts(plan: Plan, diagnostic: Diagnostic = { _ in }) async -> [String] {
         let records = Dictionary(uniqueKeysWithValues:
             ((try? await ContainerService.listContainers()) ?? []).map { ($0.id, $0) })
         let entries: [(service: String, name: String, ip: String)] = plan.allServices.compactMap { svc in
@@ -1101,7 +1169,11 @@ extension Compose {
             else { return nil }
             return (svc.service, svc.name, ip)
         }
-        guard !entries.isEmpty else { return [] }
+        guard !entries.isEmpty else {
+            diagnostic("hosts: no running \(plan.project) containers to sync")
+            return []
+        }
+        diagnostic("hosts: syncing \(entries.count) entr\(entries.count == 1 ? "y" : "ies") for \(plan.project)")
         let block = entries.map { "\($0.ip) \($0.service) \($0.name) # davit-compose" }.joined(separator: "\n")
         // grep exit 1 just means every line was managed; anything above means
         // grep itself failed and the file must be left alone. The block comes
@@ -1124,6 +1196,8 @@ extension Compose {
                 let live = (try? await ContainerService.listContainers()) ?? []
                 guard live.first(where: { $0.id == entry.name })?.isRunning == true else { continue }
                 warnings.append("service \(entry.service): could not update /etc/hosts (no /bin/sh in this image?) — service names won't resolve there")
+            } else {
+                diagnostic("hosts: \(entry.service) (\(entry.name)) -> \(entry.ip)")
             }
         }
         return warnings
@@ -1139,15 +1213,24 @@ extension Compose {
     /// non-external networks and, with `removeVolumes`, the declared
     /// non-external volumes. Missing containers skip silently, so down is
     /// idempotent. Returns warnings (e.g. a network still in use elsewhere).
+    /// `limitContainersTo`, when non-nil, further intersects the container
+    /// selection (never the full/partial network-and-volume gate below, which
+    /// stays keyed on `requested`) — the `--down-on-failure` teardown uses
+    /// this to spare services this up run reused rather than created, without
+    /// losing the whole-project network cleanup a whole-project up implies.
     static func down(
         plan: Plan,
         services requested: [String] = [],
         removeVolumes: Bool = false,
+        limitContainersTo: Set<String>? = nil,
+        limitNetworksTo: Set<String>? = nil,
+        diagnostic: Diagnostic = { _ in },
         progress: @escaping @Sendable (StepKind, _ done: Bool) async -> Void
     ) async throws -> [String] {
         let known = Set(plan.services.map(\.service))
         for name in requested where !known.contains(name) { throw Error.noSuchService(name) }
-        let selected = requested.isEmpty ? known : Set(requested)
+        var selected = requested.isEmpty ? known : Set(requested)
+        if let limitContainersTo { selected.formIntersection(limitContainersTo) }
         var warnings: [String] = []
 
         let records = Dictionary(uniqueKeysWithValues:
@@ -1161,6 +1244,8 @@ extension Compose {
             let running = record.isRunning
             await progress(.service(svc.service), false)
             if running {
+                let grace = Int(min(svc.stopGracePeriod ?? 5, 86_400).rounded())
+                diagnostic("\(svc.service): stopping \"\(svc.name)\" (grace \(grace)s\(svc.stopSignal.map { ", signal \($0)" } ?? ""))")
                 // A stop that fails must not abort the teardown — the force-
                 // delete below removes the container either way (docker keeps
                 // going too); the user just gets told it wasn't graceful.
@@ -1168,8 +1253,11 @@ extension Compose {
                     let detail = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
                     warnings.append("service \(svc.service): stop failed (\(detail)) — deleting by force")
                 }
+            } else {
+                diagnostic("\(svc.service): \"\(svc.name)\" not running — deleting only")
             }
             try await ContainerService.delete(svc.name, force: true)
+            diagnostic("\(svc.service): deleted \"\(svc.name)\"")
             await progress(.service(svc.service), true)
         }
 
@@ -1178,8 +1266,13 @@ extension Compose {
         guard requested.isEmpty else { return warnings }
 
         let networks = Set((try? await ContainerService.listNetworks())?.map(\.name) ?? [])
-        for network in plan.networks where !plan.externalNetworks.contains(network) && networks.contains(network) {
+        // limitNetworksTo (the --down-on-failure path) restricts deletion to
+        // networks that specific up CREATED — a pre-existing project network
+        // (from an earlier successful up) must survive a failed re-up.
+        for network in plan.networks where !plan.externalNetworks.contains(network) && networks.contains(network)
+            && (limitNetworksTo?.contains(network) ?? true) {
             await progress(.network(network), false)
+            diagnostic("network \(network): removing")
             do {
                 try await ContainerService.deleteNetwork(network)
                 await progress(.network(network), true)
@@ -1191,6 +1284,7 @@ extension Compose {
             let volumes = Set((try? await ContainerService.listVolumes())?.map(\.name) ?? [])
             for volume in plan.volumes where !plan.externalVolumes.contains(volume) && volumes.contains(volume) {
                 await progress(.volume(volume), false)
+                diagnostic("volume \(volume): removing")
                 do {
                     try await ContainerService.deleteVolume(volume)
                     await progress(.volume(volume), true)
@@ -1238,6 +1332,7 @@ extension Compose {
     /// can hand out fresh IPs). Returns the warnings.
     static func start(
         plan: Plan,
+        diagnostic: Diagnostic = { _ in },
         progress: @escaping @Sendable (StepKind, _ done: Bool) async -> Void
     ) async throws -> [String] {
         var warnings: [String] = []
@@ -1251,7 +1346,7 @@ extension Compose {
             try await ContainerService.start(svc.name)
             await progress(.service(svc.service), true)
         }
-        warnings += await syncProjectHosts(plan: plan)
+        warnings += await syncProjectHosts(plan: plan, diagnostic: diagnostic)
         return warnings
     }
 
@@ -1260,10 +1355,11 @@ extension Compose {
     /// one step pair — read as "restarted" — once it is running again.
     static func restart(
         plan: Plan,
+        diagnostic: Diagnostic = { _ in },
         progress: @escaping @Sendable (StepKind, _ done: Bool) async -> Void
     ) async throws -> [String] {
         try await stop(plan: plan) { _, _ in }
-        return try await start(plan: plan, progress: progress)
+        return try await start(plan: plan, diagnostic: diagnostic, progress: progress)
     }
 
     /// Pull each plan service's image, one after the other, writing a
@@ -1380,7 +1476,9 @@ extension Compose {
     /// handler per container printing new lines as they arrive, and the call
     /// never returns — Ctrl-C ends the process (the containers keep running).
     /// `output` receives whole prefixed lines (stdout by default) so the
-    /// selftest can capture the non-follow path.
+    /// selftest can capture the non-follow path. The actual per-stream
+    /// tail/follow mechanics live in `followLogStreams` below, shared with
+    /// `davit run`'s single-container attach (Main.swift RunCLI).
     static func logs(
         plan: Plan,
         services requested: [String] = [],
@@ -1393,24 +1491,61 @@ extension Compose {
         for name in requested where !known.contains(name) { throw Error.noSuchService(name) }
         let selected = requested.isEmpty ? known : Set(requested)
 
-        // Log lines bypass print's stdio buffer — flush it so any headers the
-        // CLI printed earlier stay ahead of them when stdout is a pipe.
-        fflush(stdout)
-
         let existing = Set(try await ContainerService.listContainers().map(\.id))
         let targets = plan.services.filter { selected.contains($0.service) && existing.contains($0.name) }
         let width = targets.map(\.name.count).max() ?? 0
-        var streams: [(prefix: String, name: String, handle: FileHandle, backlog: Bool)] = []
+        var streams: [LogStream] = []
         for svc in targets {
-            // Index 0 is the stdio log, 1 the boot log (LogStreamer convention);
-            // a container deleted since the snapshot just drops out. The fds
-            // come dup'd from XPC with closeOnDealloc off — close what we
-            // don't keep or every call leaks the boot-log descriptor.
-            guard let handles = try? await ContainerClient().logs(id: svc.name), !handles.isEmpty else { continue }
-            for extra in handles.dropFirst() { try? extra.close() }
+            guard let handle = await openLogHandle(svc.name) else { continue }
             let prefix = svc.name.padding(toLength: width, withPad: " ", startingAt: 0) + "  | "
-            streams.append((prefix, svc.name, handles[0], !skipBacklogFor.contains(svc.service)))
+            streams.append(LogStream(prefix: prefix, name: svc.name, handle: handle, backlog: !skipBacklogFor.contains(svc.service)))
         }
+        try await followLogStreams(streams, tail: tail, follow: follow, output: output)
+    }
+
+    /// Opens a container's primary stdio log handle. Index 0 of the pair
+    /// `ContainerClient.logs` returns is stdio, 1 is the boot log (LogStreamer
+    /// convention); a container deleted since the last snapshot just drops
+    /// out (`nil`). The fds come dup'd from XPC with closeOnDealloc off — the
+    /// boot-log handle is closed immediately or every call leaks it. Not
+    /// `private`: `davit run`'s attach path (Main.swift RunCLI) opens a
+    /// single stream this same way before handing it to `followLogStreams`.
+    static func openLogHandle(_ name: String) async -> FileHandle? {
+        guard let handles = try? await ContainerClient().logs(id: name), !handles.isEmpty else { return nil }
+        for extra in handles.dropFirst() { try? extra.close() }
+        return handles[0]
+    }
+
+    /// One log stream to print/follow: `prefix` is prepended to every line
+    /// (compose's aligned `"<name>  | "`, or `""` for a single container like
+    /// `davit run`'s attach); `name` is the container id, used to notice it
+    /// exiting; `backlog` gates whether any tail is replayed at all (compose's
+    /// `skipBacklogFor`).
+    struct LogStream {
+        let prefix: String
+        let name: String
+        let handle: FileHandle
+        let backlog: Bool
+    }
+
+    /// Prints each stream's backlog (bounded by `tail`, skipped entirely when
+    /// `backlog` is false) then, if `follow`, streams new lines until every
+    /// stream's container has stopped running. The shared core of compose
+    /// `logs`/`up`'s attach (many streams, aligned prefixes) and `davit run`'s
+    /// attach (one stream, no prefix) — never returns while followed
+    /// containers are still running; the caller owns the process lifetime
+    /// (Ctrl-C / exit()).
+    static func followLogStreams(
+        _ streams: [LogStream],
+        tail: Int?,
+        follow: Bool,
+        output: @escaping @Sendable (String) -> Void
+    ) async throws {
+        // Log lines bypass print's stdio buffer — flush it so any headers a
+        // caller printed earlier (compose's "Attaching to logs", `davit run`'s
+        // banner) stay ahead of them when stdout is a pipe or, as here, a
+        // process that exits before its buffered stdio is otherwise flushed.
+        fflush(stdout)
 
         for stream in streams {
             // Remember the end of file before the backwards tail read, so the
@@ -1484,11 +1619,16 @@ extension Compose {
     /// countable failures (failures before start_period has elapsed don't count).
     /// Fails fast when the container stops (docker parity: no point probing a
     /// dead dependency). Bounded by start_period + retries × (interval + timeout).
-    static func waitHealthy(service: String, container: String, healthcheck hc: Healthcheck) async throws {
+    static func waitHealthy(
+        service: String, container: String, healthcheck hc: Healthcheck,
+        diagnostic: Diagnostic = { _ in }
+    ) async throws {
         let started = ContinuousClock.now
         var failures = 0
         var abandoned = 0
+        var attempt = 0
         while true {
+            attempt += 1
             // A probe exceeding its timeout counts as failed but keeps running in
             // the container: apple/container (1.0.0 and 1.1.0) can't signal exec processes
             // (see ContainerService.ExecTimeout), so it's abandoned, not killed.
@@ -1498,9 +1638,12 @@ extension Compose {
             let result = try? await ContainerService.exec(container, hc.argv, timeout: .seconds(hc.timeout))
             if result == nil {  // timed out (abandoned in-guest) or exec failed outright
                 abandoned += 1
+                diagnostic("\(service): health probe #\(attempt) — timed out (abandoned \(abandoned)/3)")
                 if abandoned >= 3 {
                     throw Error.unhealthy(service: service, failures: max(failures, abandoned))
                 }
+            } else {
+                diagnostic("\(service): health probe #\(attempt) — exit \(result!.exitCode)")
             }
             if result?.exitCode == 0 { return }
             if let records = try? await ContainerService.listContainers(),
