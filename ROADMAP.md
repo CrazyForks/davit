@@ -92,6 +92,11 @@ remaining A item is #2 (file browsing), intentionally scheduled in Wave 2.
   pulls, run auto-pull, compose, machine create. Build-time base images still
   resolve in the shim (future).
 - ✅ #4/#5/#6 answered + FAQ ("replace Docker Desktop?", local images, compose).
+**Wave 6 — polish + anticipated features (shipped v0.1.16):**
+- 1 one-click local DNS domains; 2 compose `build:`; 3 container stop
+  notifications; 4 ⌘K global search; 5 Docker Hub search in Pull;
+  6 volume content browsing; 7 image layer inspection. (8 devcontainers held.)
+
 - Later: usage metrics — decided (2026-07-13) against feature telemetry (audience
   trust); if wanted, the appcast model: point update checks at davit.app and count
   access-log requests (disclosed, no payload). GitHub release download counts
