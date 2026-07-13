@@ -11,6 +11,7 @@ struct UpdateInfo: Equatable {
 
 enum UpdateChecker {
     static let repo = "wouterdebie/davit"
+    static let appcastURL = URL(string: "https://davit.app/appcast.json")!
     static let lastCheckKey = "lastUpdateCheck"
     static let skippedVersionKey = "skippedUpdateVersion"
 
@@ -19,7 +20,46 @@ enum UpdateChecker {
     }
 
     /// Returns the latest release if it is newer than the running version.
+    ///
+    /// The check hits davit.app's appcast first — a static JSON published by
+    /// the release workflow. Full disclosure (also in the site FAQ): that
+    /// request is the only thing Davit ever sends anywhere besides GitHub,
+    /// it carries no payload or identifiers beyond a normal HTTP GET, and its
+    /// access-log line (kept briefly, then deleted) is how install counts are
+    /// estimated. Downloads themselves still come from GitHub releases. If
+    /// the appcast is unreachable or stale-looking, GitHub's API remains the
+    /// fallback so updates never depend on davit.app being up.
     static func fetchAvailableUpdate() async throws -> UpdateInfo? {
+        do {
+            return try await fetchFromAppcast()  // nil = fresh "no update"
+        } catch {
+            return try await fetchFromGitHub()
+        }
+    }
+
+    private struct Appcast: Decodable {
+        let version: String
+        let downloadURL: URL
+        let releasePageURL: URL
+    }
+
+    /// nil = appcast reachable but no newer version; throws = unusable (caller
+    /// falls back to GitHub). A nil from here intentionally does NOT fall
+    /// back: "no update" is a valid, fresh answer.
+    private static func fetchFromAppcast() async throws -> UpdateInfo? {
+        var request = URLRequest(url: appcastURL)
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.timeoutInterval = 10
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw CLIError(command: "update check", message: "appcast returned HTTP \((response as? HTTPURLResponse)?.statusCode ?? -1)")
+        }
+        let appcast = try JSONDecoder().decode(Appcast.self, from: data)
+        guard isNewer(appcast.version, than: currentVersion) else { return nil }
+        return UpdateInfo(version: appcast.version, downloadURL: appcast.downloadURL, releasePageURL: appcast.releasePageURL)
+    }
+
+    private static func fetchFromGitHub() async throws -> UpdateInfo? {
         var request = URLRequest(url: URL(string: "https://api.github.com/repos/\(repo)/releases/latest")!)
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         let (data, response) = try await URLSession.shared.data(for: request)

@@ -40,6 +40,10 @@ struct GeneralSettings: View {
             Section("Container Platform") {
                 TextField("Install root (blank = auto-detect, e.g. /usr/local)", text: $binaryPath)
                     .textFieldStyle(.roundedBorder)
+                    // Match the Platform tab (and the app convention picked
+                    // after the HN "types from the right" report): input text
+                    // is leading-aligned everywhere.
+                    .multilineTextAlignment(.leading)
                 if let binary = state.resolvedBinary {
                     LabeledContent("Resolved") {
                         Text("\(binary.path) — \(binary.source.rawValue)")
@@ -342,13 +346,14 @@ struct SystemSettings: View {
                     }
                     Section {
                         DisclosureGroup("Effective configuration (JSON)") {
-                            ScrollView {
-                                Text(model.rawJSON)
-                                    .font(.system(size: 10.5, design: .monospaced))
-                                    .textSelection(.enabled)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                            .frame(height: 150)
+                            // No inner ScrollView: the settings form already
+                            // scrolls, and a scrollbar-in-a-scrollbar is worse
+                            // than a long section. Expand to full content size.
+                            Text(model.rawJSON)
+                                .font(.system(size: 10.5, design: .monospaced))
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
                     }
                 }

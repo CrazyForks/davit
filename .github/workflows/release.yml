@@ -14,6 +14,9 @@ env:
   MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
   # Presence of this token enables the Homebrew tap bump after release.
   TAP_PUSH_TOKEN: ${{ secrets.TAP_PUSH_TOKEN }}
+  # Presence of this key (a service account scoped to the davit-app bucket)
+  # enables publishing the update appcast to davit.app after release.
+  GCS_SA_KEY: ${{ secrets.GCS_SA_KEY }}
 
 jobs:
   release:
@@ -153,6 +156,22 @@ jobs:
             Davit-*.zip.sha256
           generate_release_notes: true
           body_path: RELEASE_NOTES.md
+
+      - name: Publish appcast to davit.app
+        if: env.GCS_SA_KEY != ''
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          cat > appcast.json <<EOF
+          {
+            "version": "${VERSION}",
+            "downloadURL": "https://github.com/wouterdebie/davit/releases/download/v${VERSION}/Davit-${VERSION}.zip",
+            "releasePageURL": "https://github.com/wouterdebie/davit/releases/tag/v${VERSION}"
+          }
+          EOF
+          echo "$GCS_SA_KEY" > /tmp/gcs-sa.json
+          gcloud auth activate-service-account --key-file=/tmp/gcs-sa.json
+          gsutil -h "Cache-Control:no-cache" cp appcast.json gs://davit-app/appcast.json
+          rm -f /tmp/gcs-sa.json
 
       - name: Bump Homebrew tap
         if: env.TAP_PUSH_TOKEN != ''

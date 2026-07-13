@@ -134,6 +134,11 @@
   <h1>Davit</h1>
   <p class="tag">A fully native macOS app for Apple's container platform. Run Linux containers on Apple silicon; no Docker Desktop required.</p>
   <p class="sub">Free &amp; open source · MIT licensed · Signed &amp; notarized</p>
+  <p class="sub" id="gh-stats" style="display:none; margin-top:6px">
+    <a href="https://github.com/wouterdebie/davit/stargazers" style="color:var(--muted);text-decoration:none">&#9733; <span id="gh-stars">-</span> stars</a>
+    &nbsp;·&nbsp;
+    <a href="https://github.com/wouterdebie/davit/releases" style="color:var(--muted);text-decoration:none">&#8595; <span id="gh-downloads">-</span> downloads</a>
+  </p>
   <div class="cta">
     <a class="btn primary" href="https://github.com/wouterdebie/davit/releases/latest">Download for macOS</a>
     <a class="btn secondary" href="https://github.com/wouterdebie/davit">View on GitHub</a>
@@ -266,6 +271,10 @@
       <p>Yes. Every release is Developer ID signed and notarized by Apple, so it opens without Gatekeeper warnings. It's open source (MIT); you can read or build it yourself. It talks only to your local container daemon and to GitHub for update checks.</p>
     </details>
     <details>
+      <summary>Does Davit phone home?</summary>
+      <p>Almost not. The app talks to your local container daemon, and to GitHub for release downloads. The one exception: once a day the updater fetches <code>davit.app/appcast.json</code> to learn the latest version. That request carries no payload, no identifiers and nothing about you or your containers; the server's access log (deleted after 30 days) is used only to estimate how many installs exist. There is no feature telemetry of any kind, and the updater falls back to GitHub's API if davit.app is unreachable. The relevant code is <a href="https://github.com/wouterdebie/davit/blob/main/Sources/ContainerStack/Updater.swift">Updater.swift</a>; read it.</p>
+    </details>
+    <details>
       <summary>Do I need the <code>container</code> CLI installed?</summary>
       <p>No. Davit talks to the platform directly over XPC. If the platform isn't present, Davit can download and install Apple's signed package for you on first launch; no admin password required. It can optionally add the <code>container</code> CLI to your shell from Settings if you want it.</p>
     </details>
@@ -283,5 +292,23 @@
   </div>
 </footer>
 
+<script>
+(async () => {
+  try {
+    const fmt = n => n >= 1000 ? (n / 1000).toFixed(1).replace(/\.0$/, "") + "k" : String(n);
+    const [repo, releases] = await Promise.all([
+      fetch("https://api.github.com/repos/wouterdebie/davit").then(r => r.ok ? r.json() : null),
+      fetch("https://api.github.com/repos/wouterdebie/davit/releases?per_page=100").then(r => r.ok ? r.json() : null),
+    ]);
+    if (!repo || !releases) return;
+    const downloads = releases.flatMap(r => r.assets || [])
+      .filter(a => a.name && a.name.endsWith(".zip"))
+      .reduce((sum, a) => sum + (a.download_count || 0), 0);
+    document.getElementById("gh-stars").textContent = fmt(repo.stargazers_count || 0);
+    document.getElementById("gh-downloads").textContent = fmt(downloads);
+    document.getElementById("gh-stats").style.display = "";
+  } catch (e) { /* stats are decoration; stay hidden */ }
+})();
+</script>
 </body>
 </html>
