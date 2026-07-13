@@ -172,15 +172,11 @@ struct RunContainerSheet: View {
                 HStack(alignment: .firstTextBaseline, spacing: 18) {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("CPUs").font(.caption).foregroundStyle(.secondary)
-                        TextField("4", text: $cpus)
-                            .textFieldStyle(.roundedBorder)
-                            .frame(width: 60)
+                        CountStepperControl(text: $cpus, placeholder: "4", defaultValue: 4)
                     }
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Memory").font(.caption).foregroundStyle(.secondary)
-                        TextField("1gb", text: $memory)
-                            .textFieldStyle(.roundedBorder)
-                            .frame(width: 90)
+                        MemoryStepperControl(text: $memory, allowsEmpty: true, defaultText: "1GB")
                     }
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Network").font(.caption).foregroundStyle(.secondary)

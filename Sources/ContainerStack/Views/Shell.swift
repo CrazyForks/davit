@@ -82,7 +82,8 @@ struct MainWindow: View {
                     selection = .containers
                 }
             }
-            if ProcessInfo.processInfo.arguments.contains("--pose-settings-registries") {
+            if ProcessInfo.processInfo.arguments.contains("--pose-settings-registries")
+                || ProcessInfo.processInfo.arguments.contains("--pose-settings-tab") {
                 Task { @MainActor in
                     try? await Task.sleep(for: .seconds(6))
                     openSettings()

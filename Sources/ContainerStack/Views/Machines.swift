@@ -192,11 +192,20 @@ struct CreateMachineSheet: View {
                     .textFieldStyle(.roundedBorder)
                 TextField("Name", text: $name)
                     .textFieldStyle(.roundedBorder)
-                HStack {
-                    TextField("CPUs (default: half your cores)", text: $cpus)
-                        .textFieldStyle(.roundedBorder)
-                    TextField("Memory (default: half your RAM)", text: $memory)
-                        .textFieldStyle(.roundedBorder)
+                HStack(alignment: .firstTextBaseline, spacing: 18) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("CPUs (default: half your cores)").font(.caption).foregroundStyle(.secondary)
+                        CountStepperControl(
+                            text: $cpus,
+                            placeholder: "\(max(1, ProcessInfo.processInfo.activeProcessorCount / 2))",
+                            defaultValue: max(1, ProcessInfo.processInfo.activeProcessorCount / 2))
+                    }
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Memory (default: half your RAM)").font(.caption).foregroundStyle(.secondary)
+                        MemoryStepperControl(
+                            text: $memory, allowsEmpty: true,
+                            defaultText: "\(max(1, Int(ProcessInfo.processInfo.physicalMemory / 2 / 1_073_741_824)))GB")
+                    }
                 }
             }
             .formStyle(.columns)
@@ -468,11 +477,15 @@ struct EditMachineSheet: View {
                 .font(.caption).foregroundStyle(.secondary)
 
             Form {
-                HStack {
-                    TextField("CPUs", text: $cpus)
-                        .textFieldStyle(.roundedBorder)
-                    TextField("Memory (e.g. 8G)", text: $memory)
-                        .textFieldStyle(.roundedBorder)
+                HStack(alignment: .firstTextBaseline, spacing: 18) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("CPUs").font(.caption).foregroundStyle(.secondary)
+                        CountStepperControl(text: $cpus)
+                    }
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Memory").font(.caption).foregroundStyle(.secondary)
+                        MemoryStepperControl(text: $memory)
+                    }
                 }
                 Picker("Home directory", selection: $homeMount) {
                     Text("Mounted read-write").tag("rw")

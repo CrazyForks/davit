@@ -2,9 +2,21 @@ import SwiftUI
 
 struct SettingsView: View {
     private enum Tab { case general, platform, registries, about }
-    // Harness: `--pose-settings-registries` lands on the Registries tab for screenshots.
-    @State private var tab: Tab =
-        ProcessInfo.processInfo.arguments.contains("--pose-settings-registries") ? .registries : .general
+    // Harness: `--pose-settings-registries` lands on the Registries tab, and
+    // `--pose-settings-tab <name>` on any tab, for screenshots.
+    @State private var tab: Tab = {
+        let args = ProcessInfo.processInfo.arguments
+        if args.contains("--pose-settings-registries") { return .registries }
+        if let i = args.firstIndex(of: "--pose-settings-tab"), i + 1 < args.count {
+            switch args[i + 1] {
+            case "platform": return .platform
+            case "registries": return .registries
+            case "about": return .about
+            default: return .general
+            }
+        }
+        return .general
+    }()
 
     var body: some View {
         TabView(selection: $tab) {
@@ -38,12 +50,10 @@ struct GeneralSettings: View {
     var body: some View {
         Form {
             Section("Container Platform") {
-                TextField("Install root (blank = auto-detect, e.g. /usr/local)", text: $binaryPath)
-                    .textFieldStyle(.roundedBorder)
-                    // Match the Platform tab (and the app convention picked
-                    // after the HN "types from the right" report): input text
-                    // is leading-aligned everywhere.
-                    .multilineTextAlignment(.leading)
+                // Match the Platform tab (and the app convention picked
+                // after the HN "types from the right" report): labeled row,
+                // leading-aligned input.
+                LabeledField(label: "Install root", hint: "blank = auto-detect", text: $binaryPath, width: 240)
                 if let binary = state.resolvedBinary {
                     LabeledContent("Resolved") {
                         Text("\(binary.path) — \(binary.source.rawValue)")
@@ -337,7 +347,7 @@ struct SystemSettings: View {
                 Form {
                     Section("Defaults for New Containers") {
                         SteppedCountField(label: "CPUs", hint: model.hint("container.cpus"), text: $model.containerCpus)
-                        LabeledField(label: "Memory", hint: model.hint("container.memory"), text: $model.containerMemory, width: 120)
+                        MemorySizeField(label: "Memory", hint: model.hint("container.memory"), text: $model.containerMemory)
                     }
                     Section("Registry & DNS") {
                         LabeledField(label: "Default registry", hint: model.hint("registry.domain"), text: $model.registryDomain)
@@ -346,7 +356,7 @@ struct SystemSettings: View {
                     }
                     Section("Builder") {
                         SteppedCountField(label: "CPUs", hint: model.hint("build.cpus"), text: $model.buildCpus)
-                        LabeledField(label: "Memory", hint: model.hint("build.memory"), text: $model.buildMemory, width: 120)
+                        MemorySizeField(label: "Memory", hint: model.hint("build.memory"), text: $model.buildMemory)
                         Toggle("Rosetta (x86-64 builds)", isOn: $model.buildRosetta)
                     }
                     Section("Advanced") {
@@ -355,7 +365,7 @@ struct SystemSettings: View {
                         LabeledField(label: "Kernel binary path", hint: model.hint("kernel.binaryPath"), text: $model.kernelBinaryPath, width: 300)
                         LabeledField(label: "Init image (vminit)", hint: model.hint("vminit.image"), text: $model.vminitImage, width: 300)
                         SteppedCountField(label: "Machine CPUs", hint: model.hint("machine.cpus"), text: $model.machineCpus)
-                        LabeledField(label: "Machine memory", hint: model.hint("machine.memory"), text: $model.machineMemory, width: 120)
+                        MemorySizeField(label: "Machine memory", hint: model.hint("machine.memory"), text: $model.machineMemory)
                     }
                     Section {
                         DisclosureGroup("Effective configuration (JSON)") {
@@ -490,6 +500,21 @@ struct SteppedCountField: View {
     }
 }
 
+/// Memory row for the settings form: label + hint left, stepper control right.
+struct MemorySizeField: View {
+    let label: String
+    var hint: String? = nil
+    @Binding var text: String
+
+    var body: some View {
+        LabeledContent {
+            MemoryStepperControl(text: $text)
+        } label: {
+            FieldLabel(label: label, hint: hint)
+        }
+    }
+}
+
 // MARK: - About
 
 struct AboutSettings: View {
@@ -568,28 +593,37 @@ struct DNSDomainsRow: View {
                         .controlSize(.small)
                 }
             }
-            HStack {
-                TextField("New domain (e.g. test)", text: $newDomain)
-                    .textFieldStyle(.roundedBorder)
-                    .frame(width: 180)
-                Button("Create\u{2026}") {
-                    let domain = newDomain.trimmingCharacters(in: .whitespaces)
-                    run {
-                        try await DNSDomainService.create(domain)
-                        await MainActor.run {
-                            newDomain = ""
-                            if defaultDomain.isEmpty { defaultDomain = domain }
-                        }
-                    }
+            LabeledContent {
+                HStack(spacing: 8) {
+                    if working { ProgressView().controlSize(.small) }
+                    TextField("", text: $newDomain, prompt: Text("test"))
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 140)
+                        .multilineTextAlignment(.leading)
+                        .onSubmit { create() }
+                    Button("Create\u{2026}") { create() }
+                        .disabled(newDomain.trimmingCharacters(in: .whitespaces).isEmpty || working)
                 }
-                .disabled(newDomain.trimmingCharacters(in: .whitespaces).isEmpty || working)
-                if working { ProgressView().controlSize(.small) }
+            } label: {
+                FieldLabel(label: "New domain", hint: nil)
             }
             Text("Creating or deleting a domain asks for administrator authorization (it writes /etc/resolver).")
                 .font(.caption)
                 .foregroundStyle(.tertiary)
             if let errorText {
                 Text(errorText).font(.caption).foregroundStyle(.red).textSelection(.enabled)
+            }
+        }
+    }
+
+    private func create() {
+        let domain = newDomain.trimmingCharacters(in: .whitespaces)
+        guard !domain.isEmpty, !working else { return }
+        run {
+            try await DNSDomainService.create(domain)
+            await MainActor.run {
+                newDomain = ""
+                if defaultDomain.isEmpty { defaultDomain = domain }
             }
         }
     }
