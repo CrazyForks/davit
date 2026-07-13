@@ -28,6 +28,7 @@ enum Compose {
         var dependsOn: [String: DependsCondition]
         var stopGracePeriod: Double? // seconds; nil = platform stop default
         var stopSignal: String?      // signal name or number — the daemon parses it
+        var build: BuildSpec?        // when set, `up` builds this image first
         var id: String { service }
 
         /// Equivalent `container run …` (what Davit performs over XPC).
@@ -56,6 +57,14 @@ enum Compose {
                 managementArgs[i] == flag && i + 1 < managementArgs.count ? managementArgs[i + 1] : nil
             }
         }
+    }
+
+    /// A compose `build:` block resolved to absolute paths + the tag to build.
+    struct BuildSpec: Hashable {
+        var context: String        // absolute
+        var dockerfile: String     // absolute
+        var tag: String            // image ref to produce
+        var args: [String]         // KEY=value
     }
 
     struct Plan: Identifiable {
@@ -113,7 +122,7 @@ enum Compose {
             case .noServices: return "no services defined"
             case .invalidServiceName(let s):
                 return "service name \(s.debugDescription) is invalid — only [a-zA-Z0-9._-] is allowed"
-            case .missingImage(let s): return "service \"\(s)\" has no image — build: is not supported yet"
+            case .missingImage(let s): return "service \"\(s)\" has neither image: nor build:"
             case .foreignContainer(let n):
                 return "container \"\(n)\" exists but was not created by this compose project (missing \(Compose.projectLabel) label) — delete or rename it, then run up again"
             case .dependencyCycle(let names): return "depends_on cycle: \(names.joined(separator: " → "))"
@@ -448,7 +457,12 @@ enum Compose {
     ) throws -> (ServicePlan, warnings: [String]) {
         var warnings: [String] = []
 
-        guard let image = svc["image"] as? String, !image.isEmpty else {
+        // image OR build (docker allows build-only; with both, image is the
+        // tag the build produces).
+        let explicitImage = (svc["image"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        let buildSpec = try parseBuild(svc["build"], service: key, project: key,
+                                       image: explicitImage, baseDir: baseDir, warnings: &warnings)
+        guard let image = explicitImage ?? buildSpec?.tag else {
             throw Error.missingImage(service: key)
         }
         let name = (svc["container_name"] as? String) ?? "\(project)-\(key)"
@@ -731,7 +745,7 @@ enum Compose {
             "image", "container_name", "environment", "env_file", "user", "working_dir",
             "ports", "volumes", "networks", "cpus", "mem_limit", "deploy", "command",
             "entrypoint", "depends_on", "profiles", "healthcheck", "stop_grace_period",
-            "stop_signal",
+            "stop_signal", "build",
         ]
         for k in svc.keys.sorted() where !handled.contains(k) {
             warnings.append("\(key): \"\(k)\" is not supported — ignored")
@@ -744,7 +758,7 @@ enum Compose {
             processArgs: process, managementArgs: management,
             resourceArgs: resource, commandArgs: command,
             profiles: profiles, healthcheck: healthcheck, dependsOn: deps,
-            stopGracePeriod: stopGrace, stopSignal: stopSignal)
+            stopGracePeriod: stopGrace, stopSignal: stopSignal, build: buildSpec)
         return (plan, warnings)
     }
 
@@ -801,6 +815,57 @@ enum Compose {
     }
 
     // MARK: helpers
+    /// Parse a compose `build:` value (string context, or a map with context/
+    /// dockerfile/args). Returns nil when there's no build key. Paths resolve
+    /// against the compose file's directory. The produced tag is the explicit
+    /// image if given, else <service>:latest.
+    private static func parseBuild(
+        _ raw: Any?, service: String, project: String, image: String?,
+        baseDir: String?, warnings: inout [String]
+    ) throws -> BuildSpec? {
+        guard let raw else { return nil }
+        func abs(_ path: String) -> String {
+            if path.hasPrefix("/") { return path }
+            let base = baseDir ?? FileManager.default.currentDirectoryPath
+            return URL(fileURLWithPath: base).appendingPathComponent(path).standardizedFileURL.path
+        }
+        var context = "."
+        var dockerfile: String? = nil
+        var args: [String] = []
+        switch raw {
+        case let str as String:
+            context = str
+        case let map as [String: Any]:
+            if let c = map["context"] as? String { context = c }
+            if let d = map["dockerfile"] as? String { dockerfile = d }
+            switch map["args"] {
+            case let list as [Any]: args = list.map(scalarString)
+            case let m as [String: Any]:
+                for (k, v) in m.sorted(by: { $0.key < $1.key }) { args.append("\(k)=\(scalarString(v))") }
+            default: break
+            }
+            for k in map.keys where !["context", "dockerfile", "args"].contains(k) {
+                warnings.append("\(service): build.\(k) is not supported — ignored")
+            }
+        default:
+            warnings.append("\(service): unrecognized build value — ignored")
+            return nil
+        }
+        let contextAbs = abs(context)
+        // docker resolves `dockerfile` relative to the CONTEXT dir, not the
+        // compose file; an absolute dockerfile is honored as-is.
+        let dockerfileAbs: String
+        if let dockerfile {
+            dockerfileAbs = dockerfile.hasPrefix("/")
+                ? dockerfile
+                : URL(fileURLWithPath: contextAbs).appendingPathComponent(dockerfile).standardizedFileURL.path
+        } else {
+            dockerfileAbs = "\(contextAbs)/Dockerfile"
+        }
+        let tag = image ?? "\(service):latest"
+        return BuildSpec(context: contextAbs, dockerfile: dockerfileAbs, tag: tag, args: args)
+    }
+
 
     private static func mountSpec(source: String, target: String, readonly: Bool, baseDir: String?) -> String {
         let isBind = source.hasPrefix("/") || source.hasPrefix("~") || source.hasPrefix("./") || source.hasPrefix("../")
@@ -994,12 +1059,14 @@ extension Compose {
     enum StepKind: Hashable {
         case volume(String), network(String), service(String)
         case waiting(service: String, condition: String)
+        case building(service: String)
 
         /// Human-readable form for CLI progress lines.
         var label: String {
             switch self {
             case .volume(let v): return "volume \(v)"
             case .network(let n): return "network \(n)"
+            case .building(let s): return "building \(s)"
             case .service(let s): return "service \(s)"
             case .waiting(let s, let c): return "waiting \(s) (\(c))"
             }
@@ -1110,6 +1177,13 @@ extension Compose {
 
             await progress(.service(svc.service), false)
             diagnostic("\(svc.service): \(svc.cliPreview)")
+            if let build = svc.build {
+                await progress(.building(service: svc.service), false)
+                _ = try await BuildService.build(BuildService.Request(
+                    contextDir: build.context, dockerfilePath: build.dockerfile,
+                    tag: build.tag, buildArgs: build.args)) { diagnostic($0) }
+                await progress(.building(service: svc.service), true)
+            }
             if let record = preexisting[svc.name], !record.isRunning {
                 // Ours, but not running (stopped, or created-but-start-failed) —
                 // recreate from the current plan rather than diffing config.

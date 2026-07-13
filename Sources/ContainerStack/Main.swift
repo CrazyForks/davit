@@ -2016,6 +2016,41 @@ enum SelfTest {
                                     projectName: "q", environment: ["EMPTY": ""]).services[0].image == "xy"
             else { throw CLIError(command: "selftest", message: "? should accept a set-but-empty variable") }
         }
+        await step("compose: build: parsing (context/dockerfile/args, image-as-tag)") {
+            let plan = try Compose.parse(text: """
+            name: davit-selftest-build
+            services:
+              fromstr:
+                build: ./svc
+              frommap:
+                build:
+                  context: ./ctx
+                  dockerfile: Dockerfile.dev
+                  args: [FOO=bar]
+                image: myorg/app:1.2
+              buildandnothing:
+                image: alpine:latest
+            """, projectName: "ignored", baseDir: "/proj")
+            let byName = Dictionary(uniqueKeysWithValues: plan.services.map { ($0.service, $0) })
+            guard let str = byName["fromstr"]?.build else {
+                throw CLIError(command: "selftest", message: "string build: not parsed")
+            }
+            guard str.context == "/proj/svc", str.dockerfile == "/proj/svc/Dockerfile",
+                  str.tag == "fromstr:latest" else {
+                throw CLIError(command: "selftest", message: "string build resolved wrong: \(str)")
+            }
+            guard let map = byName["frommap"]?.build else {
+                throw CLIError(command: "selftest", message: "map build: not parsed")
+            }
+            guard map.context == "/proj/ctx", map.dockerfile == "/proj/ctx/Dockerfile.dev",
+                  map.tag == "myorg/app:1.2", map.args == ["FOO=bar"],
+                  byName["frommap"]?.image == "myorg/app:1.2" else {
+                throw CLIError(command: "selftest", message: "map build resolved wrong: \(map), image \(byName["frommap"]?.image ?? "nil")")
+            }
+            guard byName["buildandnothing"]?.build == nil else {
+                throw CLIError(command: "selftest", message: "image-only service got a spurious build spec")
+            }
+        }
         await step("compose: env_file + entrypoint") {
             let fm = FileManager.default
             let dir = fm.temporaryDirectory.appendingPathComponent("davit-selftest-envfile-\(UUID().uuidString)")
