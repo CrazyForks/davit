@@ -164,11 +164,29 @@ final class AppState: ObservableObject {
 
         let (cs, imgs, vols, nets, df) = await (c, i, v, n, d)
         machines = (await m) ?? []
-        if let cs { containers = cs.sorted { sortKey($0) < sortKey($1) } }
+        if let cs {
+            let sorted = cs.sorted { sortKey($0) < sortKey($1) }
+            notifyUnexpectedStops(old: containers, new: sorted)
+            containers = sorted
+        }
         if let imgs { images = imgs.sorted { $0.shortNameTag < $1.shortNameTag } }
         if let vols { volumes = vols.sorted { $0.name < $1.name } }
         if let nets { networks = nets.sorted { $0.name < $1.name } }
         if let df { diskUsage = df }
+    }
+
+    /// running -> stopped without a Davit-initiated stop/kill/delete => notify
+    /// (opt-in). Deleted-while-running also consumes its mark and stays quiet.
+    private func notifyUnexpectedStops(old: [ContainerRecord], new: [ContainerRecord]) {
+        guard StopNotifier.enabled, !old.isEmpty else { return }
+        let newByID = Dictionary(uniqueKeysWithValues: new.map { ($0.id, $0) })
+        for was in old where was.isRunning {
+            let isRunningNow = newByID[was.id]?.isRunning ?? false
+            guard !isRunningNow else { continue }
+            if !ExpectedStops.shared.consume(was.id) && newByID[was.id] != nil {
+                StopNotifier.notifyStopped(was.id)
+            }
+        }
     }
 
     private func sortKey(_ c: ContainerRecord) -> String {

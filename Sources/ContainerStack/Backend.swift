@@ -167,6 +167,27 @@ enum Backend {
 
 // MARK: - Typed service API (same facade as before, now XPC-backed)
 
+/// Stops Davit itself initiated (stop/kill/delete/restart buttons, compose
+/// down, recreate). Used to tell an expected running->stopped transition from
+/// an unexpected one (crash, OOM, external kill) for notifications.
+final class ExpectedStops: @unchecked Sendable {
+    static let shared = ExpectedStops()
+    private let lock = NSLock()
+    private var stamps: [String: Date] = [:]
+
+    func mark(_ id: String) {
+        lock.lock(); stamps[id] = Date(); lock.unlock()
+    }
+
+    /// True (and consumes the mark) when the stop was requested in the last
+    /// couple of minutes — long enough for a slow graceful stop to complete.
+    func consume(_ id: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard let at = stamps.removeValue(forKey: id) else { return false }
+        return Date().timeIntervalSince(at) < 120
+    }
+}
+
 enum ContainerService {
     // MARK: Listing
 
@@ -308,11 +329,13 @@ enum ContainerService {
     /// Compose down passes stop_grace_period / stop_signal through here; the
     /// signal is a name or number ("SIGUSR1", "USR1", "10") parsed daemon-side.
     static func stop(_ id: String, timeoutSeconds: Int32 = 5, signal: String? = nil) async throws {
+        ExpectedStops.shared.mark(id)
         try await ContainerClient().stop(
             id: id, opts: ContainerStopOptions(timeoutInSeconds: timeoutSeconds, signal: signal))
     }
 
     static func kill(_ id: String) async throws {
+        ExpectedStops.shared.mark(id)
         try await ContainerClient().kill(id: id, signal: "KILL")
     }
 
@@ -322,6 +345,7 @@ enum ContainerService {
     }
 
     static func delete(_ id: String, force: Bool) async throws {
+        ExpectedStops.shared.mark(id)
         try await ContainerClient().delete(id: id, force: force)
     }
 
@@ -335,6 +359,7 @@ enum ContainerService {
     static func stopAll() async throws {
         let client = ContainerClient()
         for snapshot in try await client.list() where snapshot.status == .running {
+            ExpectedStops.shared.mark(snapshot.id)
             try? await client.stop(id: snapshot.id)
         }
     }
@@ -1418,5 +1443,36 @@ enum DNSDomainService {
 
     private static func shellQuote(_ s: String) -> String {
         "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+}
+
+
+// MARK: - Container stop notifications
+
+import UserNotifications
+
+/// Posts a macOS notification when a container stops without Davit having
+/// asked it to (crash, OOM kill, external stop). Opt-in via Settings.
+enum StopNotifier {
+    static let defaultsKey = "notifyUnexpectedStops"
+
+    static var enabled: Bool { UserDefaults.standard.bool(forKey: defaultsKey) }
+
+    /// Requests authorization once, on first enable. Safe to call repeatedly.
+    static func requestAuthorization() {
+        guard Bundle.main.bundleIdentifier != nil else { return }  // headless/dev
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+
+    static func notifyStopped(_ id: String) {
+        guard enabled, Bundle.main.bundleIdentifier != nil else { return }
+        let content = UNMutableNotificationContent()
+        content.title = "Container stopped"
+        content.body = "\(id) stopped unexpectedly."
+        content.sound = .default
+        let request = UNNotificationRequest(
+            identifier: "container-stopped-\(id)-\(UUID().uuidString)",
+            content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request)
     }
 }

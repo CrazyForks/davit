@@ -75,6 +75,18 @@ struct GeneralSettings: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            Section("Notifications") {
+                Toggle("Notify when a container stops unexpectedly", isOn: Binding(
+                    get: { UserDefaults.standard.bool(forKey: StopNotifier.defaultsKey) },
+                    set: { on in
+                        UserDefaults.standard.set(on, forKey: StopNotifier.defaultsKey)
+                        if on { StopNotifier.requestAuthorization() }
+                    }
+                ))
+                Text("Stops you trigger in Davit (incl. compose down) stay quiet; crashes and external stops notify.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             Section("Startup") {
                 LoginItemToggle()
             }

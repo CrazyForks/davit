@@ -413,6 +413,9 @@ struct PullImageSheet: View {
     var prefilledReference: String? = nil
     @State private var reference = ""
     @State private var started = false
+    @State private var hits: [HubHit] = []
+    @State private var searching = false
+    @State private var searchTask: Task<Void, Never>?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -425,9 +428,10 @@ struct PullImageSheet: View {
 
             VStack(alignment: .leading, spacing: 12) {
                 HStack {
-                    TextField("Image reference (e.g. nginx:latest, ghcr.io/org/app:tag)", text: $reference)
+                    TextField("Search Docker Hub or enter a reference (nginx, ghcr.io/org/app:tag)", text: $reference)
                         .textFieldStyle(.roundedBorder)
                         .onSubmit { pull() }
+                        .onChange(of: reference) { scheduleSearch() }
                         .disabled(model.isRunning)
                     Button {
                         pull()
@@ -441,9 +445,46 @@ struct PullImageSheet: View {
                     .buttonStyle(.borderedProminent)
                     .disabled(reference.isEmpty || model.isRunning)
                 }
-                Text("Try: nginxdemos/hello (open it in your browser) · alpine · postgres · redis · node")
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
+                if !started {
+                    if searching {
+                        HStack(spacing: 6) { ProgressView().controlSize(.small); Text("Searching Docker Hub…").font(.caption).foregroundStyle(.secondary) }
+                    } else if hits.isEmpty {
+                        Text("Type to search Docker Hub, or enter a full reference (e.g. ghcr.io/org/app:tag).")
+                            .font(.caption).foregroundStyle(.tertiary)
+                    } else {
+                        ScrollView {
+                            VStack(spacing: 0) {
+                                ForEach(hits) { hit in
+                                    Button {
+                                        reference = hit.isOfficial ? hit.name : hit.name
+                                        hits = []
+                                    } label: {
+                                        HStack(spacing: 8) {
+                                            Image(systemName: hit.isOfficial ? "checkmark.seal.fill" : "shippingbox")
+                                                .foregroundStyle(hit.isOfficial ? Color.accentColor : .secondary)
+                                            VStack(alignment: .leading, spacing: 1) {
+                                                Text(hit.name).font(.body.weight(.medium))
+                                                if !hit.description.isEmpty {
+                                                    Text(hit.description).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                                                }
+                                            }
+                                            Spacer()
+                                            if let stars = hit.stars {
+                                                Label("\(stars)", systemImage: "star").font(.caption).foregroundStyle(.secondary)
+                                            }
+                                        }
+                                        .contentShape(Rectangle())
+                                        .padding(.vertical, 5).padding(.horizontal, 8)
+                                    }
+                                    .buttonStyle(.plain)
+                                    Divider()
+                                }
+                            }
+                        }
+                        .frame(maxHeight: 220)
+                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(.separator))
+                    }
+                }
 
                 if started {
                     ConsoleView(lines: model.lines)
@@ -469,7 +510,7 @@ struct PullImageSheet: View {
             }
             .padding(16)
         }
-        .frame(width: 560, height: started ? 480 : 220)
+        .frame(width: 560, height: started ? 480 : (hits.isEmpty ? 220 : 400))
         .task {
             if let prefilledReference, !started {
                 reference = prefilledReference
@@ -482,6 +523,58 @@ struct PullImageSheet: View {
             }
         }
         .onDisappear { model.cancel() }
+    }
+
+    struct HubHit: Identifiable {
+        let name: String
+        let description: String
+        let stars: Int?
+        let isOfficial: Bool
+        var id: String { name }
+    }
+
+    /// Debounced Docker Hub search. Skips anything that already looks like a
+    /// concrete reference (a registry host, a tag, or a digest) — you're
+    /// typing an exact image then, not searching.
+    private func scheduleSearch() {
+        searchTask?.cancel()
+        let query = reference.trimmingCharacters(in: .whitespaces)
+        let looksConcrete = query.contains("/") || query.contains(":") || query.contains("@") || query.count < 2
+        guard !looksConcrete else { hits = []; searching = false; return }
+        searchTask = Task {
+            try? await Task.sleep(for: .milliseconds(300))
+            if Task.isCancelled { return }
+            await MainActor.run { searching = true }
+            let results = await Self.searchHub(query)
+            if Task.isCancelled { return }
+            await MainActor.run {
+                // Ignore stale responses if the field moved on.
+                if reference.trimmingCharacters(in: .whitespaces) == query {
+                    hits = results
+                    searching = false
+                }
+            }
+        }
+    }
+
+    private static func searchHub(_ query: String) async -> [HubHit] {
+        guard let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+              let url = URL(string: "https://hub.docker.com/v2/search/repositories/?page_size=10&query=\(encoded)")
+        else { return [] }
+        guard let (data, resp) = try? await URLSession.shared.data(from: url),
+              (resp as? HTTPURLResponse)?.statusCode == 200,
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let results = obj["results"] as? [[String: Any]]
+        else { return [] }
+        return results.compactMap { r in
+            guard let name = r["repo_name"] as? String else { return nil }
+            let official = !name.contains("/")  // Hub official images are single-segment
+            return HubHit(
+                name: name,
+                description: (r["short_description"] as? String) ?? "",
+                stars: r["star_count"] as? Int,
+                isOfficial: official)
+        }
     }
 
     private func pull() {
