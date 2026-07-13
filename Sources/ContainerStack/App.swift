@@ -65,6 +65,8 @@ struct ContainerStackApp: App {
             CommandGroup(after: .newItem) {
                 Button("Refresh") { Task { await state.refreshAll() } }
                     .keyboardShortcut("r", modifiers: .command)
+                Button("Search…") { state.showCommandPalette = true }
+                    .keyboardShortcut("k", modifiers: .command)
             }
         }
 

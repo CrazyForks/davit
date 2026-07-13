@@ -47,6 +47,14 @@ struct MainWindow: View {
             // switch to Containers, which consumes the intent and pushes detail.
             if state.pendingContainerOpen != nil { selection = .containers }
         }
+        .onChange(of: state.pendingOpen?.section) {
+            // ⌘K jumped to a resource: switch to its section; that section's
+            // view consumes state.pendingOpen and opens the detail.
+            if let section = state.pendingOpen?.section { selection = section }
+        }
+        .sheet(isPresented: $state.showCommandPalette) {
+            CommandPalette()
+        }
         .task {
             if ProcessInfo.processInfo.arguments.contains("--probe-dashboard-open") {
                 Task { @MainActor in

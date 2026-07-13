@@ -30,6 +30,8 @@ struct MachinesView: View {
         .navigationDestination(for: String.self) { id in
             MachineDetailView(machineID: id)
         }
+        .onChange(of: state.pendingOpen?.id) { consumePendingOpen() }
+        .onAppear { consumePendingOpen() }
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 Button {
@@ -55,6 +57,13 @@ struct MachinesView: View {
                 }
             }
         }
+    }
+
+    /// ⌘K jumped to a machine: push its detail.
+    private func consumePendingOpen() {
+        guard state.pendingOpen?.section == .machines, let id = state.pendingOpen?.id else { return }
+        state.pendingOpen = nil
+        if state.machines.contains(where: { $0.id == id }), path.last != id { path.append(id) }
     }
 
     private var list: some View {

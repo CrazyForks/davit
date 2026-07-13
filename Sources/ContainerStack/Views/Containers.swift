@@ -74,6 +74,7 @@ struct ContainersView: View {
                 RunContainerSheet()
             }
             .onChange(of: state.pendingContainerOpen) { consumePendingOpen() }
+            .onChange(of: state.pendingOpen?.id) { consumePendingOpen() }
             .onAppear { consumePendingOpen() }
         }
         // Separate node from the run sheet — two .sheet on one node shadow each other.
@@ -132,8 +133,14 @@ struct ContainersView: View {
             .refreshIndicator(state.isRefreshing)
     }
 
-    /// Reveal a container requested from another section (e.g. the Dashboard).
+    /// Reveal a container requested from another section (e.g. the Dashboard,
+    /// or ⌘K global search).
     private func consumePendingOpen() {
+        if state.pendingOpen?.section == .containers, let id = state.pendingOpen?.id {
+            state.pendingOpen = nil
+            if path.last != id { path.append(id) }
+            return
+        }
         guard let id = state.pendingContainerOpen else { return }
         state.pendingContainerOpen = nil
         if path.last != id { path.append(id) }

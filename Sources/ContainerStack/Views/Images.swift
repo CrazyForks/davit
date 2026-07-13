@@ -34,6 +34,8 @@ struct ImagesView: View {
             .navigationDestination(for: ImageRecord.self) { image in
                 ImageDetailView(imageID: image.id)
             }
+            .onChange(of: state.pendingOpen?.id) { consumePendingOpen() }
+            .onAppear { consumePendingOpen() }
             .searchable(text: $search, placement: .toolbar, prompt: "Filter images")
             .toolbar {
                 ToolbarItemGroup(placement: .primaryAction) {
@@ -77,6 +79,15 @@ struct ImagesView: View {
         ImageListContent(images: filtered, open: { path.append($0) }, run: { runFromImage = $0 },
                          pullLatest: { pullLatestTarget = $0 })
             .refreshIndicator(state.isRefreshing)
+    }
+
+    /// ⌘K jumped to an image: push its detail.
+    private func consumePendingOpen() {
+        guard state.pendingOpen?.section == .images, let id = state.pendingOpen?.id else { return }
+        state.pendingOpen = nil
+        if let image = state.images.first(where: { $0.id == id }), path.last != image {
+            path.append(image)
+        }
     }
 }
 

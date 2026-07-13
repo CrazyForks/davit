@@ -28,6 +28,10 @@ final class AppState: ObservableObject {
     /// Cross-view intent: a container to reveal in the Containers detail view
     /// (e.g. clicked from the Dashboard). Consumed by ContainersView.
     @Published var pendingContainerOpen: String?
+    /// ⌘K global search intent: (section, resource id). MainWindow switches to
+    /// the section; the section's view opens the detail where it has one.
+    @Published var pendingOpen: (section: SidebarSection, id: String)?
+    @Published var showCommandPalette = false
     @Published var lastError: CLIError?
     @Published var isRefreshing = false
     @Published var initialLoadDone = false
