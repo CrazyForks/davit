@@ -157,6 +157,18 @@ jobs:
           generate_release_notes: true
           body_path: RELEASE_NOTES.md
 
+      # macOS runners have no Google Cloud SDK; these two actions provide
+      # credentials + gsutil for the appcast upload.
+      - name: Authenticate to GCS
+        if: env.GCS_SA_KEY != ''
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCS_SA_KEY }}
+
+      - name: Set up gcloud
+        if: env.GCS_SA_KEY != ''
+        uses: google-github-actions/setup-gcloud@v2
+
       - name: Publish appcast to davit.app
         if: env.GCS_SA_KEY != ''
         run: |
@@ -168,10 +180,7 @@ jobs:
             "releasePageURL": "https://github.com/wouterdebie/davit/releases/tag/v${VERSION}"
           }
           EOF
-          echo "$GCS_SA_KEY" > /tmp/gcs-sa.json
-          gcloud auth activate-service-account --key-file=/tmp/gcs-sa.json
           gsutil -h "Cache-Control:no-cache" cp appcast.json gs://davit-app/appcast.json
-          rm -f /tmp/gcs-sa.json
 
       - name: Bump Homebrew tap
         if: env.TAP_PUSH_TOKEN != ''
