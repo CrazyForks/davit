@@ -569,8 +569,32 @@ enum ContainerService {
         } catch let e as CLIError {
             throw e
         } catch {
+            if let friendly = friendlyStartError(String(describing: error)) {
+                throw CLIError(command: "system start", message: friendly)
+            }
             throw CLIError.wrap("system start", error)
         }
+    }
+
+    /// Translate a cryptic platform startup error into an actionable one.
+    /// Returns nil when unrecognized (caller keeps the raw message).
+    static func friendlyStartError(_ raw: String) -> String? {
+        // A health-check field failing to decode means the running daemon is a
+        // different (older) container-apiserver than the version Davit ships —
+        // typically a pre-existing `container` install answering instead of
+        // Davit's own. (apple/container issue: the client hard-requires fields
+        // its own health reply calls optional.)
+        if raw.contains("in health check"), raw.contains("decode") {
+            return """
+            A different version of the container platform is running than Davit expects \
+            (Davit ships \(PlatformInstaller.pinnedVersion)). This usually means an older \
+            `container` was already installed — the official package or Homebrew — and its \
+            daemon is the one answering. Stop it with `container system stop` (or reboot), \
+            then start services again so Davit's own \(PlatformInstaller.pinnedVersion) \
+            platform takes over.
+            """
+        }
+        return nil
     }
 
     static func systemStop() async throws {
@@ -1494,22 +1518,47 @@ enum StopReason: Equatable, Hashable {
     /// own `--memory` limit (memory cgroup OOM, not host RAM exhaustion).
     /// `process` is the killed process name when the kernel logged it.
     case outOfMemory(process: String?)
+    /// An amd64 image failed under Rosetta with an "unhandled auxiliary vector
+    /// type" error — Rosetta is present but too old (the macOS it shipped with
+    /// predates the aux-vector entry the guest passes). `vectorType` is the
+    /// numeric type from the message (e.g. "29" = AT_HWCAP3) when present.
+    case rosettaIncompatible(vectorType: String?)
 
     var isOOM: Bool { if case .outOfMemory = self { return true }; return false }
 }
 
 extension ContainerService {
-    /// Inspect a stopped container's kernel (boot) log for an out-of-memory
-    /// kill scoped to its own memory cgroup. The boot log is the VM kernel ring
-    /// for this container's last run, so a hit means *this* stop. Only the tail
-    /// is read; returns nil on any error (best-effort, never throws).
+    /// Inspect a stopped container's logs for a recognizable death cause: a
+    /// Rosetta-too-old failure in the process (stdio) log, or an out-of-memory
+    /// kill in the kernel (boot) log. Both logs are the ring for this
+    /// container's last run, so a hit means *this* stop. Only tails are read;
+    /// returns nil on any error (best-effort, never throws).
     static func stopReason(_ id: String) async -> StopReason? {
-        guard let handles = try? await ContainerClient().logs(id: id), handles.count > 1 else {
+        guard let handles = try? await ContainerClient().logs(id: id), !handles.isEmpty else {
             return nil
         }
-        let boot = handles[1]
-        defer { try? boot.close() }
-        return stopReason(fromKernelLines: LogStreamer.readTail(fh: boot, maxLines: 500))
+        defer { handles.forEach { try? $0.close() } }
+        let stdio = LogStreamer.readTail(fh: handles[0], maxLines: 200)
+        let kernel = handles.count > 1 ? LogStreamer.readTail(fh: handles[1], maxLines: 500) : []
+        return stopReason(fromStdioLines: stdio, kernelLines: kernel)
+    }
+
+    /// Pure log scan over both streams, split out for unit testing.
+    static func stopReason(fromStdioLines stdio: [String], kernelLines kernel: [String]) -> StopReason? {
+        // Rosetta refusing the binary happens at exec, before the process can
+        // do anything else, so it wins over any later signal.
+        for line in stdio.reversed()
+        where line.contains("rosetta error") && line.contains("auxiliary vector") {
+            return .rosettaIncompatible(vectorType: auxVectorType(in: line))
+        }
+        return stopReason(fromKernelLines: kernel)
+    }
+
+    /// Pull the numeric aux-vector type out of "unhandled auxiliary vector type 29".
+    private static func auxVectorType(in line: String) -> String? {
+        guard let r = line.range(of: "auxiliary vector type ") else { return nil }
+        let digits = line[r.upperBound...].prefix { $0.isNumber }
+        return digits.isEmpty ? nil : String(digits)
     }
 
     /// Pure kernel-log scan, split out so it's unit-testable with captured
@@ -1564,12 +1613,16 @@ enum StopNotifier {
     static func notifyStopped(_ id: String, reason: StopReason? = nil, limitBytes: Int64 = 0) {
         guard enabled, Bundle.main.bundleIdentifier != nil else { return }
         let content = UNMutableNotificationContent()
-        if case .outOfMemory(let process) = reason {
+        switch reason {
+        case .outOfMemory(let process):
             content.title = "Container ran out of memory"
             let who = process.map { "\($0) " } ?? ""
             let limit = limitBytes > 0 ? " (limit \(formatBytes(limitBytes)))" : ""
             content.body = "\(id): \(who)was killed for exceeding its memory limit\(limit). Increase memory with Edit & Recreate."
-        } else {
+        case .rosettaIncompatible:
+            content.title = "Rosetta couldn't run this image"
+            content.body = "\(id): this amd64 image needs a newer Rosetta than your macOS provides. Update macOS, or run an arm64 image."
+        case .none:
             content.title = "Container stopped"
             content.body = "\(id) stopped unexpectedly."
         }

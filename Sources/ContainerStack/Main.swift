@@ -2914,6 +2914,38 @@ enum SelfTest {
             }
         }
 
+        await step("stop reason: Rosetta aux-vector failure in stdio wins over kernel noise") {
+            // Real issue #14 line: an old Rosetta refusing a newer amd64 binary.
+            let stdio = ["rosetta error: unhandled auxiliary vector type 29"]
+            guard ContainerService.stopReason(fromStdioLines: stdio, kernelLines: [])
+                == .rosettaIncompatible(vectorType: "29") else {
+                throw CLIError(command: "selftest", message: "Rosetta aux-vector error not parsed (type 29)")
+            }
+            // Rosetta failure is at exec, so it takes precedence over any OOM line.
+            let oomKernel = ["Memory cgroup out of memory: Killed process 1 (app)"]
+            guard case .rosettaIncompatible = ContainerService.stopReason(fromStdioLines: stdio, kernelLines: oomKernel) else {
+                throw CLIError(command: "selftest", message: "Rosetta should win over a kernel OOM line")
+            }
+            // Ordinary stdio is not misread as a Rosetta failure.
+            guard ContainerService.stopReason(fromStdioLines: ["listening on :8080"], kernelLines: []) == nil else {
+                throw CLIError(command: "selftest", message: "ordinary stdio produced a spurious Rosetta reason")
+            }
+        }
+
+        await step("system start: health-check decode failure explains the version mismatch") {
+            let raw = "internalError: \"failed to decode apiServerBuild in health check\""
+            guard let friendly = ContainerService.friendlyStartError(raw) else {
+                throw CLIError(command: "selftest", message: "version-skew health error not translated")
+            }
+            guard friendly.contains("different version"), friendly.contains(PlatformInstaller.pinnedVersion) else {
+                throw CLIError(command: "selftest", message: "friendly start error missing version guidance: \(friendly)")
+            }
+            // Unrelated errors are left untouched (caller keeps the raw message).
+            guard ContainerService.friendlyStartError("some unrelated failure") == nil else {
+                throw CLIError(command: "selftest", message: "friendlyStartError should only fire for known cases")
+            }
+        }
+
         await step("stop reason: live OOM kill is detected from the boot log") {
             let name = "davit-selftest-oom"
             try? await ContainerService.delete(name, force: true)

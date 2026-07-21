@@ -51,6 +51,11 @@ struct ContainerDetailView: View {
             openLogsOnBoot = true
             tab = .logs
         }
+        .onReceive(NotificationCenter.default.publisher(for: .davitShowStdioLog)) { note in
+            guard note.object as? String == containerID else { return }
+            openLogsOnBoot = false
+            tab = .logs
+        }
         .toolbar {
             if let container {
                 ToolbarItemGroup(placement: .primaryAction) {
@@ -158,8 +163,11 @@ struct ContainerOverviewTab: View {
 
     private var content: some View {
             VStack(spacing: 14) {
-                if case .outOfMemory(let process) = state.stopReasons[container.id], !container.isRunning {
-                    oomBanner(process: process)
+                if !container.isRunning, let reason = state.stopReasons[container.id] {
+                    switch reason {
+                    case .outOfMemory(let process): oomBanner(process: process)
+                    case .rosettaIncompatible(let vectorType): rosettaBanner(vectorType: vectorType)
+                    }
                 }
 
                 DetailCard(title: "General", icon: "info.circle") {
@@ -268,26 +276,57 @@ struct ContainerOverviewTab: View {
         let limit = container.configuration.resources?.memoryInBytes ?? 0
         let who = process.map { "“\($0)” " } ?? "A process "
         let limitText = limit > 0 ? " of \(formatBytes(limit))" : ""
-        return HStack(alignment: .top, spacing: 12) {
-            Image(systemName: "memorychip")
+        return stopBanner(
+            icon: "memorychip",
+            title: "Stopped: out of memory",
+            message: "\(who)exceeded this container's memory limit\(limitText) and was killed by the kernel. Give it more memory and recreate it."
+        ) {
+            Button("Edit & Recreate…") { state.recreateTarget = container }
+                .controlSize(.small)
+            Button("View kernel log") {
+                NotificationCenter.default.post(name: .davitShowBootLog, object: container.id)
+            }
+            .controlSize(.small)
+        }
+    }
+
+    /// Shown when an amd64 image failed under Rosetta because Rosetta is too
+    /// old for the aux-vector entry the guest passes (see issue #14). Fixed by
+    /// updating macOS (Rosetta ships with the OS) or using an arm64 image.
+    private func rosettaBanner(vectorType: String?) -> some View {
+        let detail = vectorType.map { " (auxiliary vector type \($0))" } ?? ""
+        return stopBanner(
+            icon: "cpu",
+            title: "Stopped: Rosetta couldn't run this image",
+            message: "This amd64 image needs a newer Rosetta than your macOS provides\(detail). Rosetta ships with macOS, so a software update usually fixes it; otherwise run an arm64 image."
+        ) {
+            Button("Open Software Update") {
+                NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.Software-Update-Settings.extension")!)
+            }
+            .controlSize(.small)
+            Button("View log") {
+                NotificationCenter.default.post(name: .davitShowStdioLog, object: container.id)
+            }
+            .controlSize(.small)
+        }
+    }
+
+    /// Shared orange "here's why it stopped" banner shell.
+    private func stopBanner<Actions: View>(
+        icon: String, title: String, message: String, @ViewBuilder actions: () -> Actions
+    ) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: icon)
                 .font(.title2)
                 .foregroundStyle(.orange)
             VStack(alignment: .leading, spacing: 4) {
-                Text("Stopped: out of memory")
-                    .font(.headline)
-                Text("\(who)exceeded this container's memory limit\(limitText) and was killed by the kernel. Give it more memory and recreate it.")
+                Text(title).font(.headline)
+                Text(message)
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
-                HStack(spacing: 10) {
-                    Button("Edit & Recreate…") { state.recreateTarget = container }
-                        .controlSize(.small)
-                    Button("View kernel log") {
-                        NotificationCenter.default.post(name: .davitShowBootLog, object: container.id)
-                    }
-                    .controlSize(.small)
-                }
-                .padding(.top, 2)
+                HStack(spacing: 10) { actions() }
+                    .padding(.top, 2)
             }
             Spacer(minLength: 0)
         }
@@ -301,6 +340,8 @@ struct ContainerOverviewTab: View {
 extension Notification.Name {
     /// Overview banner -> detail view: jump to the Logs tab showing boot logs.
     static let davitShowBootLog = Notification.Name("davitShowBootLog")
+    /// Overview banner -> detail view: jump to the Logs tab (process/stdio log).
+    static let davitShowStdioLog = Notification.Name("davitShowStdioLog")
 }
 
 // MARK: - Logs tab
